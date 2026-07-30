@@ -2,7 +2,8 @@
 #include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
+#include <mbedtls/sha256.h>
 
 #define MQTT_MAX_PACKET_SIZE 1024
 #include <PubSubClient.h>
@@ -15,44 +16,38 @@
 #include <time.h>
 #include <Preferences.h>
 #include <vector>
-#include <mbedtls/md.h>
+
+#include "ota_security.h"
+#include "ota_release_config.h"
+#include "portal_ui.h"
+
+/**
+ * @file notificator_base.ino
+ * @brief Main runtime for the Notificator Base ESP32-C3 OLED device.
+ *
+ * This translation unit owns the hardware lifecycle and the state that is
+ * intentionally shared by the display, capacitive input, Wi-Fi, MQTT, and
+ * notification history. Low-coupling OTA validation and captive-portal styling
+ * live in separate modules.
+ *
+ * Target hardware:
+ * - ESP32-C3 SuperMini
+ * - SSD1306 128x64 I2C OLED
+ * - TTP223 capacitive touch sensor
+ *
+ * Persistent data is stored in the `wpnotif` Preferences namespace. Update
+ * FW_VERSION, FW_VERSION_DATE, README.md, and ARCHITECTURE.md together when
+ * release behavior changes.
+ */
+#define FW_NAME "Notificator Base Firmware"
+#define FW_VERSION "1.1.0"
+#define FW_VERSION_DATE "2026-07-30"
 
 /*
-  ============================================================================
-  File: esp32c3_oled_mqtt.ino
-  Project: Notificator Project - ESP32-C3 OLED Notifier
-
-  Firmware metadata
-  - Name: Notificator Project Device Firmware
-  - Version: 1.0.1
-  - Target: ESP32-C3 SuperMini + SSD1306 OLED + TTP223 capacitive sensor
-  - Transport: MQTT (TLS supported)
-  - Storage: Preferences (namespace: wpnotif)
-
-  Compatibility
-  - Arduino core: ESP32
-  - Display: Adafruit_SSD1306 (128x64)
-
-  Maintenance
-  - Update FW_VERSION / FW_VERSION_DATE when behavior changes.
-  - Keep gesture map and command docs aligned with implementation.
-  ============================================================================
-*/
-#define FW_NAME "Notificator Project IoT Device Firmware"
-#define FW_VERSION "1.0.1"
-#define FW_VERSION_DATE "2026-04-13"
-
-// OTA security: this secret key signs OTA commands using HMAC-SHA256.
-// Do not send it over MQTT. Rotate if leaked.
-#define OTA_SHARED_TOKEN ""
-#define OTA_REQUIRE_HTTPS true
-static const unsigned long OTA_TS_MAX_SKEW_SEC = 300;
-
-/*
-  Notificator Project ESP32-C3 firmware
+  Notificator Base ESP32-C3 firmware
   --------------------------------
   Responsibilities
-  - Input: merged gesture handler from physical button + TTP223 capacitive sensor.
+  - Input: touch-first gesture handler for the TTP223 capacitive sensor.
   - Transport: MQTT message topic + MQTT command topic per deviceId.
   - UI: status bar + message viewer + idle themes (clock / weather).
   - Storage: ring buffer persisted in Preferences key "hist".
@@ -61,14 +56,12 @@ static const unsigned long OTA_TS_MAX_SKEW_SEC = 300;
   - Stored as: "title|body"
   - If separator is missing, content is rendered as a single text block.
 
-  Gesture map (normal mode)
-  - 1 tap: mark current message read
-  - 2 taps: show next message
-  - 3 taps: toggle current message read/unread
-  - hold >= 2s: clear all messages
-  - hold >= 6s: start setup portal
-  - 4+ taps: show device id + firmware version ( single tap to get back to iddle screen )
-  - 8+ capacitive-only taps: start setup portal
+  Gesture map
+  - 1 tap: wake the display or show the next message
+  - 2 taps: toggle the current message read/unread
+  - 3 taps: show device and connection information
+  - hold >= 1.8s: mark all messages read
+  - hold >= 6s: start the setup portal
 
   Visual unread cues
   - Status bar envelope blinks when any unread message exists.
@@ -83,17 +76,14 @@ static const unsigned long OTA_TS_MAX_SKEW_SEC = 300;
 #define I2C_SDA 20
 #define I2C_SCL 21
 
-#define BUTTON_PIN 9
-#define BUTTON_ACTIVE_LOW true
 #define TTP223_PIN 0
 #define BUTTON_DEBOUNCE_MS 20
-#define BUTTON_LONG_PRESS_MS 2000
+#define BUTTON_LONG_PRESS_MS 1800
 #define BUTTON_SETUP_LONG_PRESS_MS 6000
-#define TAP_WINDOW_MS 700
+#define TAP_WINDOW_MS 420
 #define TAP_MIN_PRESS_MS 25
-#define TTP223_SETUP_TAP_COUNT 8
 
-#define SHOW_ID_TAP_COUNT 4
+#define SHOW_ID_TAP_COUNT 3
 #define SHOW_ID_DISPLAY_MS 4000
 
 #define MESSAGE_BUFFER_SIZE 10
@@ -104,14 +94,13 @@ static const unsigned long OTA_TS_MAX_SKEW_SEC = 300;
 // -------------------- MQTT --------------------
 #define MQTT_USE_TLS true
 
-const char *MQTT_HOST = "";
-const uint16_t MQTT_PORT = 8883;
-const char *MQTT_USERNAME = "";
-const char *MQTT_PASSWORD = "";
-const char *TELEMETRY_API_URL = "";
-const char *TELEMETRY_API_TOKEN = "";
-// Keep false in production. Set true only for temporary TLS diagnostics.
-#define TELEMETRY_TLS_INSECURE false
+// Optional build-time defaults for pre-provisioned devices. The setup portal
+// can replace these values, so public builds do not need broker credentials.
+const char *DEFAULT_MQTT_HOST = "";
+const uint16_t DEFAULT_MQTT_PORT = 8883;
+const char *DEFAULT_MQTT_USERNAME = "";
+const char *DEFAULT_MQTT_PASSWORD = "";
+const char *DEFAULT_MQTT_TOPIC_PREFIX = "notificator-project";
 const char *MQTT_CA_CERT = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -146,45 +135,41 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )EOF";
 
-// Netlify (api-wpnotificator.netlify.app) trust anchor.
-const char *TELEMETRY_CA_CERT = R"EOF(
------BEGIN CERTIFICATE-----
-MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
-MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
-d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
-MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
-MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
-b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
-9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
-2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
-1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
-q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
-tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
-vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
-BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
-5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
-1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
-NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
-Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
-8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
-pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
-MrY=
------END CERTIFICATE-----
-)EOF";
-
 // OTA TLS trust anchor (kept separate from MQTT for independent rotation).
 const char *OTA_CA_CERT = MQTT_CA_CERT;
-const char *OTA_ALLOWED_HOST_SUFFIX = "";
 
 WiFiClientSecure tlsClient;
 PubSubClient mqttClient(tlsClient);
 
 unsigned long lastMqttAttemptMs = 0;
 static const unsigned long MQTT_RECONNECT_MS = 2000;
-unsigned long lastAcceptedOtaTs = 0;
-bool telemetryBootReportPending = true;
-unsigned long lastTelemetryRetryMs = 0;
-static const unsigned long TELEMETRY_RETRY_MS = 30000;
+String mqttHost;
+uint16_t mqttPort = DEFAULT_MQTT_PORT;
+String mqttUsername;
+String mqttPassword;
+String mqttTopicPrefix = DEFAULT_MQTT_TOPIC_PREFIX;
+bool mqttConfigSaveRequested = false;
+bool mqttConfigValid = false;
+
+/**
+ * Authenticated release metadata loaded from the official OTA manifest.
+ *
+ * The signature covers every field required to select and verify the binary.
+ * Release notes remain presentation-only and are not needed by the device.
+ */
+struct OtaRelease
+{
+	String channel;
+	String deviceType;
+	String board;
+	String version;
+	String url;
+	String sha256;
+	String releasedAt;
+	String signature;
+	String keyId;
+	size_t size = 0;
+};
 
 // -------------------- WiFi state machine --------------------
 static const unsigned long WIFI_RETRY_MS = 3500;
@@ -213,17 +198,77 @@ static const unsigned long MSG_LED_FLASH_COOLDOWN_MS = 1200;
 String deviceId = "";
 String mqttSubTopic = "";
 String mqttCmdTopic = "";
+String mqttStatusTopic = "";
 String apSsid = "";
 unsigned long showIdUntilMs = 0;
 bool showIdSticky = false;
 unsigned long showNoMessagesUntilMs = 0;
 static const unsigned long NO_MESSAGES_DISPLAY_MS = 1400;
+enum class UiFeedback : uint8_t
+{
+	None,
+	MarkedRead,
+	MarkedUnread,
+	AllRead
+};
+UiFeedback uiFeedback = UiFeedback::None;
+unsigned long uiFeedbackUntilMs = 0;
+static const unsigned long UI_FEEDBACK_MS = 900;
 
 // -------------------- WiFiManager --------------------
+/*
+ * WiFiManager owns Wi-Fi credentials. The fields below cover Notificator
+ * configuration only. Password and signing-key buffers are intentionally
+ * cleared before the portal is rendered, so saved secrets never return to the
+ * browser.
+ */
 WiFiManager wm;
 bool portalRunning = false;
 volatile bool portalClientConnected = false;
 bool deviceConfigured = false;
+
+char mqttHostField[97] = "";
+char mqttPortField[6] = "8883";
+char mqttUsernameField[65] = "";
+char mqttPasswordField[97] = "";
+char mqttTopicField[97] = "notificator-project";
+
+WiFiManagerParameter mqttSection(
+	"<section class=\"notif-group\"><div class=\"notif-section\">"
+	"<span class=\"notif-provider\">HiveMQ Cloud only</span>"
+	"<strong>Notification delivery</strong>"
+	"<span>Create a free Serverless cluster before setup. Use the hostname and device credential from Access Management.</span></div>");
+WiFiManagerParameter mqttHostParameter(
+	"mqtt_host",
+	"HiveMQ cluster hostname",
+	mqttHostField,
+	sizeof(mqttHostField),
+	"required maxlength=\"96\" autocapitalize=\"none\" autocomplete=\"off\" placeholder=\"abc123.s1.eu.hivemq.cloud\"");
+WiFiManagerParameter mqttPortParameter(
+	"mqtt_port",
+	"Secure MQTT port",
+	mqttPortField,
+	sizeof(mqttPortField),
+	"required type=\"number\" min=\"1\" max=\"65535\" inputmode=\"numeric\"");
+WiFiManagerParameter mqttUsernameParameter(
+	"mqtt_user",
+	"MQTT username",
+	mqttUsernameField,
+	sizeof(mqttUsernameField),
+	"required maxlength=\"64\" autocapitalize=\"none\" autocomplete=\"username\"");
+WiFiManagerParameter mqttPasswordParameter(
+	"mqtt_pass",
+	"MQTT password",
+	mqttPasswordField,
+	sizeof(mqttPasswordField),
+	"maxlength=\"96\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Leave blank to keep the saved password\"");
+WiFiManagerParameter mqttTopicParameter(
+	"mqtt_topic",
+	"Topic prefix",
+	mqttTopicField,
+	sizeof(mqttTopicField),
+	"required maxlength=\"96\" autocapitalize=\"none\" autocomplete=\"off\" placeholder=\"notificator-project\"");
+WiFiManagerParameter mqttSectionEnd("</section>");
 
 unsigned long animLastMs = 0;
 uint8_t animFrame = 0;
@@ -267,6 +312,11 @@ float weatherWindKmh = 0;
 uint8_t weatherCode = 255;
 
 // -------------------- Persistent history --------------------
+/*
+ * The in-memory ring uses String for convenient rendering. The packed structs
+ * define the stable NVS wire format and bound flash writes to predictable
+ * sizes. HISTORY_VERSION must change whenever this binary layout changes.
+ */
 static const uint16_t MAX_TOPIC_CHARS = 24;
 static const uint16_t MAX_PAYLOAD_CHARS = 90;
 
@@ -290,7 +340,13 @@ struct __attribute__((packed)) PersistHistory
 static const uint32_t HISTORY_MAGIC = 0x57504E46; // 'WPNF'
 static const uint8_t HISTORY_VERSION = 3;
 
-// In-RAM history
+/*
+ * Ring-buffer invariants:
+ * - messageHead points to the oldest valid entry.
+ * - messageCount never exceeds MESSAGE_BUFFER_SIZE.
+ * - currentIndex is a physical array index, not an offset from messageHead.
+ * - a new message becomes current and starts unread.
+ */
 struct MqttMessage
 {
 	String topic;
@@ -332,20 +388,14 @@ static const float RSSI_ALPHA = 0.35f;
 static const unsigned long RSSI_UPDATE_MS = 700;
 unsigned long lastRssiUpdateMs = 0;
 
-// -------------------- Button state --------------------
-static bool btnStable = false;
-static bool btnRawLast = false;
-static unsigned long btnRawChangedMs = 0;
-
+// -------------------- Capacitive touch state --------------------
 static bool ttpStable = false;
 static bool ttpRawLast = false;
 static unsigned long ttpRawChangedMs = 0;
 
-static bool btnDown = false;
-static unsigned long btnDownMs = 0;
+static bool touchDown = false;
+static unsigned long touchDownMs = 0;
 static uint8_t ttpIdleLevel = LOW;
-static bool pressStartedByBtn = false;
-static bool pressStartedByTtp = false;
 static bool holdPreviewActive = false;
 static unsigned long holdPreviewMs = 0;
 static const unsigned long HOLD_PREVIEW_START_MS = BUTTON_LONG_PRESS_MS;
@@ -353,7 +403,7 @@ static const unsigned long HOLD_PREVIEW_START_MS = BUTTON_LONG_PRESS_MS;
 static uint8_t tapCount = 0;
 static bool tapPending = false;
 static unsigned long tapDeadlineMs = 0;
-static bool tapOnlyTtp = true;
+static bool tapSequenceStartedFromIdle = false;
 
 // -------------------- Idle --------------------
 static const unsigned long IDLE_AFTER_MS = 45000;
@@ -392,6 +442,12 @@ void startSetupPortal();
 void finalizeSetupAfterPortal();
 void setupMqttClient();
 void connectToMqtt();
+void loadMqttConfig();
+bool saveMqttConfigFromPortal();
+bool isMqttConfigComplete();
+void rebuildMqttTopics();
+void configureSetupPortal();
+void syncMqttPortalParameters();
 
 void drawBootWelcomeScreen();
 void drawSetupInstructions();
@@ -399,6 +455,7 @@ void drawPortalAnimationFrame();
 void drawDeviceIdScreen();
 void showNoMessagesOverlay();
 void drawNoMessagesScreen();
+void drawGestureFeedback();
 void updateLedIndicator();
 void drawHoldCounter(unsigned long heldMs);
 
@@ -416,7 +473,7 @@ void updateSmoothedRssi();
 uint8_t rssiBars();
 void drawRssiBars(uint8_t bars, bool dim);
 
-void handleButton();
+void handleTouchInput();
 void resetMessageFlipState(size_t idx);
 void resetTapSequence();
 
@@ -440,13 +497,10 @@ void saveIdleTheme(uint8_t v);
 void loadWeatherConfig();
 void saveWeatherConfig(bool manual);
 void handleCmdJson(const String &json);
-bool isValidOtaUrl(const String &url);
-void performOtaUpdate(const String &url, const String &targetVersion);
-bool parseVersionTriplet(const String &v, int &majorV, int &minorV, int &patchV);
-bool isRemoteVersionNewer(const String &currentV, const String &remoteV);
-String buildOtaSignBase(const String &url, const String &version, unsigned long ts, bool force, const String &device);
-bool hmacSha256Hex(const String &key, const String &message, String &outHex);
-bool publishFirmwareTelemetry(const char *eventName, const char *otaStatus = nullptr, const String &targetVersion = "", const String &error = "");
+bool fetchOfficialOtaRelease(const String &channel, OtaRelease &release, String &error);
+void performOfficialOtaUpdate(const String &channel, bool force);
+bool streamVerifiedOtaImage(const OtaRelease &release, String &error);
+bool publishDeviceStatus(const char *eventName, const char *status = nullptr, const String &targetVersion = "", const String &error = "");
 
 static inline void bumpNoIdleGuard()
 {
@@ -460,7 +514,7 @@ void resetTapSequence()
 	tapCount = 0;
 	tapPending = false;
 	tapDeadlineMs = 0;
-	tapOnlyTtp = true;
+	tapSequenceStartedFromIdle = false;
 }
 
 // -------------------- Helpers --------------------
@@ -575,6 +629,171 @@ void saveLastSsidForInfo(const String &ssid)
 	prefs.begin("wpnotif", false);
 	prefs.putString("lastSsid", ssid);
 	prefs.end();
+}
+
+static String normalizeMqttTopicPrefix(String value)
+{
+	value.trim();
+	while (value.startsWith("/"))
+		value.remove(0, 1);
+	while (value.endsWith("/"))
+		value.remove(value.length() - 1);
+	return value;
+}
+
+/**
+ * Validate a broker hostname entered through the local portal.
+ *
+ * The value must be a bare hostname. Schemes, paths, and whitespace are
+ * rejected because PubSubClient receives the port separately.
+ */
+static bool isValidMqttHost(String value)
+{
+	value.trim();
+	if (!value.length() || value.length() > 96)
+		return false;
+	if (value.indexOf("://") >= 0 || value.indexOf('/') >= 0 || value.indexOf(' ') >= 0)
+		return false;
+	return true;
+}
+
+/** Reject MQTT wildcards and whitespace in the user-controlled topic root. */
+static bool isValidMqttTopicPrefix(const String &value)
+{
+	if (!value.length() || value.length() > 96)
+		return false;
+	return value.indexOf('#') < 0 && value.indexOf('+') < 0 && value.indexOf(' ') < 0;
+}
+
+/** Return whether the locally stored broker configuration can be used. */
+bool isMqttConfigComplete()
+{
+	return isValidMqttHost(mqttHost) &&
+		   mqttPort > 0 &&
+		   mqttUsername.length() > 0 &&
+		   mqttPassword.length() > 0 &&
+		   isValidMqttTopicPrefix(mqttTopicPrefix);
+}
+
+/** Rebuild all per-device topics after identity or prefix changes. */
+void rebuildMqttTopics()
+{
+	const String root = normalizeMqttTopicPrefix(mqttTopicPrefix);
+	mqttSubTopic = root + "/" + deviceId + "/messages";
+	mqttCmdTopic = root + "/" + deviceId + "/cmd";
+	mqttStatusTopic = root + "/" + deviceId + "/status";
+}
+
+/**
+ * Load broker values from the `wpnotif` NVS namespace.
+ *
+ * Configuration is normalized and validated before mqttConfigValid is set.
+ */
+void loadMqttConfig()
+{
+	prefs.begin("wpnotif", true);
+	mqttHost = prefs.getString("mqtt_host", DEFAULT_MQTT_HOST);
+	mqttPort = prefs.getUShort("mqtt_port", DEFAULT_MQTT_PORT);
+	mqttUsername = prefs.getString("mqtt_user", DEFAULT_MQTT_USERNAME);
+	mqttPassword = prefs.getString("mqtt_pass", DEFAULT_MQTT_PASSWORD);
+	mqttTopicPrefix = prefs.getString("mqtt_topic", DEFAULT_MQTT_TOPIC_PREFIX);
+	prefs.end();
+
+	mqttHost.trim();
+	mqttUsername.trim();
+	mqttTopicPrefix = normalizeMqttTopicPrefix(mqttTopicPrefix);
+	mqttConfigValid = isMqttConfigComplete();
+}
+
+/**
+ * Populate non-secret setup fields and blank the broker password input.
+ *
+ * A blank password or signing key means "retain the saved value" when the
+ * portal is submitted.
+ */
+void syncMqttPortalParameters()
+{
+	safeCopyToC(mqttHostField, sizeof(mqttHostField), mqttHost);
+	snprintf(mqttPortField, sizeof(mqttPortField), "%u", mqttPort);
+	safeCopyToC(mqttUsernameField, sizeof(mqttUsernameField), mqttUsername);
+	mqttPasswordField[0] = '\0';
+	safeCopyToC(mqttTopicField, sizeof(mqttTopicField), mqttTopicPrefix);
+	mqttHostParameter.setValue(mqttHostField, sizeof(mqttHostField));
+	mqttPortParameter.setValue(mqttPortField, sizeof(mqttPortField));
+	mqttUsernameParameter.setValue(mqttUsernameField, sizeof(mqttUsernameField));
+	mqttPasswordParameter.setValue("", sizeof(mqttPasswordField));
+	mqttTopicParameter.setValue(mqttTopicField, sizeof(mqttTopicField));
+}
+
+/**
+ * Validate and persist Notificator fields submitted by WiFiManager.
+ *
+ * @return true when the resulting broker configuration is complete and safe
+ *         to use; false without replacing the stored values otherwise.
+ */
+bool saveMqttConfigFromPortal()
+{
+	String newHost = mqttHostParameter.getValue();
+	String newUsername = mqttUsernameParameter.getValue();
+	String newPassword = mqttPasswordParameter.getValue();
+	String newTopicPrefix = normalizeMqttTopicPrefix(String(mqttTopicParameter.getValue()));
+	String portText = mqttPortParameter.getValue();
+
+	newHost.trim();
+	newUsername.trim();
+	newPassword.trim();
+	portText.trim();
+	const long parsedPort = portText.toInt();
+	if (!isValidMqttHost(newHost) ||
+		parsedPort < 1 || parsedPort > 65535 ||
+		!newUsername.length() ||
+		(!newPassword.length() && !mqttPassword.length()) ||
+		!isValidMqttTopicPrefix(newTopicPrefix))
+	{
+		mqttConfigValid = false;
+		return false;
+	}
+
+	mqttHost = newHost;
+	mqttPort = (uint16_t)parsedPort;
+	mqttUsername = newUsername;
+	if (newPassword.length())
+		mqttPassword = newPassword;
+	mqttTopicPrefix = newTopicPrefix;
+
+	prefs.begin("wpnotif", false);
+	prefs.putString("mqtt_host", mqttHost);
+	prefs.putUShort("mqtt_port", mqttPort);
+	prefs.putString("mqtt_user", mqttUsername);
+	prefs.putString("mqtt_pass", mqttPassword);
+	prefs.putString("mqtt_topic", mqttTopicPrefix);
+	prefs.end();
+
+	mqttConfigValid = true;
+	rebuildMqttTopics();
+	return true;
+}
+
+/** Register the custom Notificator fields and offline-safe portal styling. */
+void configureSetupPortal()
+{
+	wm.setTitle("Notificator setup");
+	wm.setDarkMode(false);
+	wm.setCustomHeadElement(NOTIFICATOR_PORTAL_HEAD);
+	wm.setCustomMenuHTML(NOTIFICATOR_PORTAL_MENU);
+	wm.setShowStaticFields(true);
+	wm.setShowDnsFields(false);
+
+	wm.addParameter(&mqttSection);
+	wm.addParameter(&mqttHostParameter);
+	wm.addParameter(&mqttPortParameter);
+	wm.addParameter(&mqttUsernameParameter);
+	wm.addParameter(&mqttPasswordParameter);
+	wm.addParameter(&mqttTopicParameter);
+	wm.addParameter(&mqttSectionEnd);
+
+	wm.setSaveParamsCallback([]()
+							 { mqttConfigSaveRequested = true; });
 }
 
 // -------------------- Idle theme persistence --------------------
@@ -871,6 +1090,7 @@ void drawRssiBars(uint8_t bars, bool dim)
 }
 
 // -------------------- History persistence --------------------
+/** Reset runtime history without modifying the saved NVS blob. */
 void clearHistoryInRam()
 {
 	messageCount = 0;
@@ -886,6 +1106,7 @@ void clearHistoryInRam()
 	}
 }
 
+/** Permanently remove the serialized history blob from NVS. */
 void wipeHistoryPrefs()
 {
 	prefs.begin("wpnotif", false);
@@ -893,6 +1114,12 @@ void wipeHistoryPrefs()
 	prefs.end();
 }
 
+/**
+ * Schedule a delayed history write.
+ *
+ * Read/unread navigation can generate several mutations close together. The
+ * delay coalesces those changes and reduces NVS wear.
+ */
 void markHistoryDirty()
 {
 	if (!historyDirty)
@@ -902,6 +1129,7 @@ void markHistoryDirty()
 	}
 }
 
+/** Flush a scheduled history write after HISTORY_SAVE_DELAY_MS. */
 void maybeSaveHistory()
 {
 	if (!historyDirty)
@@ -914,6 +1142,12 @@ void maybeSaveHistory()
 	}
 }
 
+/**
+ * Serialize the logical ring order into a versioned, packed NVS record.
+ *
+ * Entries are saved oldest-to-newest with a normalized head of zero. The
+ * current physical index is converted to a logical position before storage.
+ */
 void saveHistoryToPrefsNow()
 {
 	PersistHistory ph;
@@ -961,6 +1195,12 @@ void saveHistoryToPrefsNow()
 	historyDirtySinceMs = 0;
 }
 
+/**
+ * Restore and validate the versioned history record from NVS.
+ *
+ * Unknown versions, invalid sizes, and corrupt counts fail closed to an empty
+ * history rather than attempting a partial migration.
+ */
 void loadHistoryFromPrefs()
 {
 	PersistHistory ph;
@@ -1111,15 +1351,24 @@ void drawUnreadEnvelopeMid(bool dim)
 		return;
 	}
 
-	if (unreadCount() == 0)
+	const uint16_t count = unreadCount();
+	if (count == 0)
+	{
+		if (mqttConfigValid)
+		{
+			display.setTextSize(1);
+			display.setCursor(49, 2);
+			display.print(mqttClient.connected() ? "MQTT" : "WAIT");
+		}
 		return;
+	}
 
 	updateUnreadBlink();
 	if (!unreadBlinkOn)
 		return;
 
 	const int w = 14, h = 9;
-	const int x = (OLED_WIDTH - w) / 2;
+	const int x = 51;
 	const int y = 2;
 
 	display.drawRect(x, y, w, h, SSD1306_WHITE);
@@ -1127,6 +1376,12 @@ void drawUnreadEnvelopeMid(bool dim)
 	display.drawLine(x + w - 1, y, x + w / 2, y + h / 2, SSD1306_WHITE);
 	display.drawLine(x, y + h - 1, x + w / 2, y + h / 2, SSD1306_WHITE);
 	display.drawLine(x + w - 1, y + h - 1, x + w / 2, y + h / 2, SSD1306_WHITE);
+
+	char countLabel[5];
+	snprintf(countLabel, sizeof(countLabel), "%u", count > 99 ? 99 : count);
+	display.setTextSize(1);
+	display.setCursor(69, 2);
+	display.print(countLabel);
 
 	(void)dim;
 }
@@ -1205,22 +1460,27 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 	if (!displayText.length())
 		displayText = "(empty)";
 
-	// Keep title/body readable while reserving space for the timestamp header.
-	const uint8_t textSize = bodyPhaseVisible ? 2 : chooseTextSize(displayText);
+	// Titles get visual emphasis; detail text stays compact so useful context
+	// fits on the 128x64 display without frantic paging.
+	const uint8_t textSize = bodyPhaseVisible ? 1 : chooseTextSize(displayText);
 	const uint8_t maxChars = maxCharsForSize(textSize);
 	const uint8_t maxLines = (textSize == 2)
 								 ? 2
-								 : 5;
+								 : 4;
 
 	display.clearDisplay();
 	drawStatusBar(false);
 
 	display.setTextSize(1);
 	display.setTextColor(SSD1306_WHITE);
-	const char *stateLabel = unreadMark ? "UNREAD" : "READ";
+	char positionLabel[10];
+	size_t position = (currentIndex + MESSAGE_BUFFER_SIZE - messageHead) % MESSAGE_BUFFER_SIZE;
+	if (position >= messageCount)
+		position = 0;
+	snprintf(positionLabel, sizeof(positionLabel), "%u/%u", (unsigned)(position + 1), (unsigned)messageCount);
 	int16_t lx1, ly1;
 	uint16_t lw, lh;
-	display.getTextBounds(stateLabel, 0, 0, &lx1, &ly1, &lw, &lh);
+	display.getTextBounds(positionLabel, 0, 0, &lx1, &ly1, &lw, &lh);
 	int stateX = ((int)OLED_WIDTH - (int)lw - 1) - lx1;
 
 	// Keep topic text from colliding with the right-side read/unread badge.
@@ -1239,7 +1499,7 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 	display.setCursor(0, 16);
 	display.print(header);
 	display.setCursor(stateX, 16);
-	display.print(stateLabel);
+	display.print(positionLabel);
 
 	// Per-message unread marker so unread items are identifiable while browsing.
 	const int unreadX = stateX - 5;
@@ -1249,16 +1509,22 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 	else
 		display.drawCircle(unreadX, unreadY, 2, SSD1306_WHITE);
 
+	display.drawFastHLine(0, 26, OLED_WIDTH, SSD1306_WHITE);
 	display.setTextSize(textSize);
+	display.setCursor(0, 30);
 
-	auto appendWrappedLine = [&](const String &srcLine, std::vector<String> &outLines)
+	static const uint8_t MAX_WRAPPED_LINES = 10;
+	String wrappedLines[MAX_WRAPPED_LINES];
+	uint8_t wrappedCount = 0;
+
+	auto appendWrappedLine = [&](const String &srcLine)
 	{
 		String rest = srcLine;
-		while (rest.length())
+		while (rest.length() && wrappedCount < MAX_WRAPPED_LINES)
 		{
 			if (rest.length() <= maxChars)
 			{
-				outLines.push_back(rest);
+				wrappedLines[wrappedCount++] = rest;
 				break;
 			}
 
@@ -1272,7 +1538,7 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 			chunk.trim();
 			if (chunk.length())
 			{
-				outLines.push_back(chunk);
+				wrappedLines[wrappedCount++] = chunk;
 			}
 
 			int nextStart = cut;
@@ -1282,11 +1548,8 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 		}
 	};
 
-	std::vector<String> wrappedLines;
-	wrappedLines.reserve(10);
-
 	int start = 0;
-	while (start < (int)displayText.length())
+	while (start < (int)displayText.length() && wrappedCount < MAX_WRAPPED_LINES)
 	{
 		int nl = displayText.indexOf('\n', start);
 		String part = (nl >= 0) ? displayText.substring(start, nl) : displayText.substring(start);
@@ -1294,27 +1557,27 @@ void drawWrappedMessage(const String &topic, const String &message, bool unreadM
 
 		if (!part.length())
 		{
-			wrappedLines.push_back("");
+			wrappedLines[wrappedCount++] = "";
 			continue;
 		}
-		appendWrappedLine(part, wrappedLines);
+		appendWrappedLine(part);
 	}
 
 	size_t startLine = 0;
-	if (bodyPhaseVisible && textSize == 2 && wrappedLines.size() > maxLines)
+	if (bodyPhaseVisible && wrappedCount > maxLines)
 	{
-		const uint8_t pageStride = 2; // slight overlap between pages
-		const unsigned long pageMs = 2200;
-		size_t pages = 1 + (wrappedLines.size() - maxLines + pageStride - 1) / pageStride;
+		const uint8_t pageStride = maxLines;
+		const unsigned long pageMs = 2600;
+		size_t pages = 1 + (wrappedCount - maxLines + pageStride - 1) / pageStride;
 		size_t page = (millis() / pageMs) % pages;
 		startLine = page * pageStride;
-		if (startLine + maxLines > wrappedLines.size())
+		if (startLine + maxLines > wrappedCount)
 		{
-			startLine = wrappedLines.size() - maxLines;
+			startLine = wrappedCount - maxLines;
 		}
 	}
 
-	for (size_t i = startLine; i < wrappedLines.size() && i < (startLine + maxLines); i++)
+	for (size_t i = startLine; i < wrappedCount && i < (startLine + maxLines); i++)
 	{
 		display.println(wrappedLines[i]);
 	}
@@ -1429,9 +1692,11 @@ void toggleCurrentReadStateAndPersist()
 
 	messageBuffer[currentIndex].read = !messageBuffer[currentIndex].read;
 	saveHistoryToPrefsNow();
+	uiFeedback = messageBuffer[currentIndex].read ? UiFeedback::MarkedRead : UiFeedback::MarkedUnread;
+	uiFeedbackUntilMs = millis() + UI_FEEDBACK_MS;
 
 	bumpNoIdleGuard();
-	showCurrentMessage(false);
+	drawGestureFeedback();
 }
 
 void markAllReadAndPersist()
@@ -1452,13 +1717,33 @@ void markAllReadAndPersist()
 	if (changed)
 		saveHistoryToPrefsNow();
 
+	uiFeedback = UiFeedback::AllRead;
+	uiFeedbackUntilMs = millis() + UI_FEEDBACK_MS;
 	bumpNoIdleGuard();
-	showCurrentMessage(false);
+	drawGestureFeedback();
+}
+
+void drawGestureFeedback()
+{
+	switch (uiFeedback)
+	{
+	case UiFeedback::MarkedRead:
+		drawCenteredText("MARKED", "READ", 2);
+		break;
+	case UiFeedback::MarkedUnread:
+		drawCenteredText("MARKED", "UNREAD", 2);
+		break;
+	case UiFeedback::AllRead:
+		drawCenteredText("ALL", "READ", 2);
+		break;
+	default:
+		break;
+	}
 }
 
 void clearAllMessagesAndShowFeedback()
 {
-	// Shared clear routine used by both long-press gesture and MQTT cmd clear_msgs.
+	// History deletion is intentionally available only through the MQTT command.
 	clearHistoryInRam();
 	wipeHistoryPrefs();
 	placeholdersRestamped = false;
@@ -1497,6 +1782,13 @@ static String makeHeaderWithType(const String &type)
 	return t;
 }
 
+/**
+ * Insert a notification into the bounded ring and persist it immediately.
+ *
+ * When the ring is full, the oldest entry is replaced. Text is truncated to
+ * the fixed NVS limits before it enters runtime state, keeping what the user
+ * sees consistent with what will survive a restart.
+ */
 void pushMessage(const String &header, const String &payload)
 {
 	size_t insertIndex;
@@ -1667,8 +1959,16 @@ void drawPortalAnimationFrame()
 	display.display();
 }
 
+/**
+ * Start the non-blocking WiFiManager portal.
+ *
+ * Existing secret values remain in NVS and are never copied into HTML fields.
+ * The main loop continues servicing this portal through wm.process().
+ */
 void startSetupPortal()
 {
+	syncMqttPortalParameters();
+	mqttConfigSaveRequested = false;
 	drawSetupInstructions();
 	setupScreenDrawn = false;
 	flashOnboardLedColor(170, 60, 255, 70);
@@ -1697,8 +1997,29 @@ void startSetupPortal()
 	bumpNoIdleGuard();
 }
 
+/**
+ * Validate portal results and transition back to station/MQTT operation.
+ *
+ * Invalid or incomplete broker settings reopen the portal with clear OLED
+ * feedback instead of leaving the device in a partially configured state.
+ */
 void finalizeSetupAfterPortal()
 {
+	if (mqttConfigSaveRequested && !saveMqttConfigFromPortal())
+	{
+		drawCenteredText("MQTT", "CHECK SETUP", 2);
+		delay(1200);
+		startSetupPortal();
+		return;
+	}
+	if (!mqttConfigValid)
+	{
+		drawCenteredText("MQTT", "SETUP NEEDED", 2);
+		delay(1200);
+		startSetupPortal();
+		return;
+	}
+
 	saveConfiguredFlag(true);
 	deviceConfigured = true;
 	saveLastSsidForInfo(WiFi.SSID());
@@ -1706,6 +2027,8 @@ void finalizeSetupAfterPortal()
 	drawCenteredText("SAVING", "SETTINGS", 2);
 
 	lastMqttAttemptMs = 0;
+	mqttClient.disconnect();
+	setupMqttClient();
 	bumpNoIdleGuard();
 	flashOnboardLedColor(0, 200, 140, 80);
 
@@ -1729,29 +2052,49 @@ void drawDeviceIdScreen()
 		return ((OLED_WIDTH - (int)w) / 2) - x1;
 	};
 
-	display.setTextSize(1);
 	display.setTextColor(SSD1306_WHITE);
-	display.setCursor(centerX1("DEVICE ID", 1), 14);
-	display.print("DEVICE ID");
+	const bool connectionPage = ((millis() / 2800) % 2) == 1;
 
-	// Prioritize readability: larger ID, compact version/date metadata.
-	String shortId = deviceId;
-	if (shortId.length() > 8)
-		shortId = shortId.substring(shortId.length() - 8);
-	shortId.toUpperCase();
-	display.setTextSize(2);
-	display.setCursor(centerX1(shortId.c_str(), 2), 25);
-	display.print(shortId);
+	if (!connectionPage)
+	{
+		display.setTextSize(1);
+		display.setCursor(centerX1("DEVICE ID", 1), 14);
+		display.print("DEVICE ID");
 
-	char fwBuf[20];
-	snprintf(fwBuf, sizeof(fwBuf), "v%s", FW_VERSION);
-	display.setTextSize(1);
-	display.setCursor(centerX1(fwBuf, 1), 49);
-	display.print(fwBuf);
+		String shortId = deviceId;
+		if (shortId.length() > 8)
+			shortId = shortId.substring(shortId.length() - 8);
+		shortId.toUpperCase();
+		display.setTextSize(2);
+		display.setCursor(centerX1(shortId.c_str(), 2), 25);
+		display.print(shortId);
 
-	display.setTextSize(1);
-	display.setCursor(centerX1(FW_VERSION_DATE, 1), 57);
-	display.print(FW_VERSION_DATE);
+		char fwBuf[24];
+		snprintf(fwBuf, sizeof(fwBuf), "FIRMWARE %s", FW_VERSION);
+		display.setTextSize(1);
+		display.setCursor(centerX1(fwBuf, 1), 50);
+		display.print(fwBuf);
+	}
+	else
+	{
+		display.setTextSize(1);
+		display.setCursor(centerX1("CONNECTION", 1), 14);
+		display.print("CONNECTION");
+
+		const char *connection = !WiFi.isConnected()
+									 ? "NO WIFI"
+									 : (mqttClient.connected() ? "MQTT READY" : "MQTT WAIT");
+		display.setTextSize(2);
+		display.setCursor(centerX1(connection, 2), 27);
+		display.print(connection);
+
+		String hostLabel = mqttConfigValid ? mqttHost : String("SETUP REQUIRED");
+		if (hostLabel.length() > 20)
+			hostLabel = hostLabel.substring(0, 17) + "...";
+		display.setTextSize(1);
+		display.setCursor(centerX1(hostLabel.c_str(), 1), 52);
+		display.print(hostLabel);
+	}
 
 	display.display();
 }
@@ -1769,12 +2112,12 @@ void drawHoldCounter(unsigned long heldMs)
 	display.setTextColor(SSD1306_WHITE);
 
 	display.setTextSize(1);
-	const char *holdLabel = "HOLDING";
+	const char *holdLabel = "TOUCH ACTION";
 	int16_t x1, y1;
 	uint16_t w, h;
 	display.getTextBounds(holdLabel, 0, 0, &x1, &y1, &w, &h);
 	display.setCursor(((OLED_WIDTH - (int)w) / 2) - x1, 16);
-	display.println("HOLDING");
+	display.println(holdLabel);
 
 	unsigned long whole = heldMs / 1000;
 	unsigned long tenths = (heldMs % 1000) / 100;
@@ -1790,7 +2133,7 @@ void drawHoldCounter(unsigned long heldMs)
 	const char *action = (heldMs >= BUTTON_SETUP_LONG_PRESS_MS)
 							 ? "RELEASE: SETUP"
 							 : ((heldMs >= BUTTON_LONG_PRESS_MS)
-									? "RELEASE: CLEAR"
+									? "RELEASE: READ ALL"
 									: "KEEP HOLDING");
 	display.getTextBounds(action, 0, 0, &x1, &y1, &w, &h);
 	display.setCursor(((OLED_WIDTH - (int)w) / 2) - x1, 56);
@@ -1850,6 +2193,13 @@ const char *weatherCodeToShort(uint8_t code)
 	}
 }
 
+/**
+ * Resolve approximate location and timezone from the network's public IP.
+ *
+ * This request is made only for weather-capable idle themes and is skipped
+ * after a manual location override. No device ID or Notificator credential is
+ * included in the request.
+ */
 bool fetchGeoByIPNow()
 {
 	if (!WiFi.isConnected())
@@ -1945,13 +2295,20 @@ void maybeFetchGeoByIP()
 	}
 }
 
+/**
+ * Fetch current conditions for the active coordinates from Open-Meteo.
+ *
+ * The request contains latitude, longitude, and timezone only. No credentials
+ * or notification data are sent. TLS certificate verification is currently
+ * omitted to avoid another trust anchor in the constrained firmware image.
+ */
 bool fetchWeatherNow()
 {
 	if (!WiFi.isConnected())
 		return false;
 
 	WiFiClientSecure client;
-	client.setInsecure(); // weather is not sensitive; keeps setup simple
+	client.setInsecure();
 
 	HTTPClient http;
 
@@ -2080,334 +2437,396 @@ void drawIdleWeatherFrame()
 }
 
 // -------------------- Commands --------------------
-bool isValidOtaUrl(const String &url)
+/**
+ * Publish retained device health and OTA lifecycle information.
+ *
+ * Core fields are always included. Status, targetVersion, and error are added
+ * only when supplied by the caller.
+ *
+ * @return false when MQTT is unavailable or publish fails.
+ */
+bool publishDeviceStatus(const char *eventName, const char *status, const String &targetVersion, const String &error)
 {
-	String u = url;
-	u.trim();
-	if (!u.length())
+	if (!mqttClient.connected() || !mqttStatusTopic.length())
 		return false;
 
-	if (OTA_REQUIRE_HTTPS)
-		return u.startsWith("https://");
-	return u.startsWith("https://") || u.startsWith("http://");
-}
-
-static String extractUrlHost(const String &url)
-{
-	int schemePos = url.indexOf("://");
-	int hostStart = (schemePos >= 0) ? (schemePos + 3) : 0;
-	int hostEnd = url.indexOf('/', hostStart);
-
-	String hostPort = (hostEnd >= 0) ? url.substring(hostStart, hostEnd)
-									 : url.substring(hostStart);
-
-	int atPos = hostPort.lastIndexOf('@');
-	if (atPos >= 0)
-		hostPort = hostPort.substring(atPos + 1);
-
-	int colonPos = hostPort.indexOf(':');
-	String host = (colonPos >= 0) ? hostPort.substring(0, colonPos)
-								  : hostPort;
-
-	host.trim();
-	host.toLowerCase();
-	if (host.endsWith("."))
-		host.remove(host.length() - 1);
-	return host;
-}
-
-bool isAllowedOtaHost(const String &url)
-{
-	String host = extractUrlHost(url);
-	if (!host.length())
-		return false;
-
-	// Enforce wildcard-style policy: only subdomains of wp-notificator.com.
-	// Example allowed: updates.wp-notificator.com
-	// Example denied: wp-notificator.com, evilwp-notificator.com
-	return host.endsWith(OTA_ALLOWED_HOST_SUFFIX);
-}
-
-bool parseVersionTriplet(const String &v, int &majorV, int &minorV, int &patchV)
-{
-	majorV = 0;
-	minorV = 0;
-	patchV = 0;
-
-	int d1 = v.indexOf('.');
-	if (d1 < 0)
-		return false;
-	int d2 = v.indexOf('.', d1 + 1);
-	if (d2 < 0)
-		return false;
-
-	String a = v.substring(0, d1);
-	String b = v.substring(d1 + 1, d2);
-	String c = v.substring(d2 + 1);
-
-	a.trim();
-	b.trim();
-	c.trim();
-
-	if (!a.length() || !b.length() || !c.length())
-		return false;
-
-	for (size_t i = 0; i < a.length(); i++)
-		if (!isDigit(a[i]))
-			return false;
-	for (size_t i = 0; i < b.length(); i++)
-		if (!isDigit(b[i]))
-			return false;
-	for (size_t i = 0; i < c.length(); i++)
-		if (!isDigit(c[i]))
-			return false;
-
-	majorV = a.toInt();
-	minorV = b.toInt();
-	patchV = c.toInt();
-	return true;
-}
-
-bool isRemoteVersionNewer(const String &currentV, const String &remoteV)
-{
-	int cMaj = 0, cMin = 0, cPat = 0;
-	int rMaj = 0, rMin = 0, rPat = 0;
-
-	if (!parseVersionTriplet(currentV, cMaj, cMin, cPat))
-		return false;
-	if (!parseVersionTriplet(remoteV, rMaj, rMin, rPat))
-		return false;
-
-	if (rMaj != cMaj)
-		return rMaj > cMaj;
-	if (rMin != cMin)
-		return rMin > cMin;
-	return rPat > cPat;
-}
-
-String buildOtaSignBase(const String &url, const String &version, unsigned long ts, bool force, const String &device)
-{
-	String base;
-	base.reserve(url.length() + version.length() + device.length() + 32);
-	base += device;
-	base += "|";
-	base += url;
-	base += "|";
-	base += version;
-	base += "|";
-	base += String(ts);
-	base += "|";
-	base += (force ? "1" : "0");
-	return base;
-}
-
-bool hmacSha256Hex(const String &key, const String &message, String &outHex)
-{
-	outHex = "";
-
-	const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-	if (!md)
-		return false;
-
-	unsigned char mac[32];
-	int rc = mbedtls_md_hmac(md,
-							 (const unsigned char *)key.c_str(), key.length(),
-							 (const unsigned char *)message.c_str(), message.length(),
-							 mac);
-	if (rc != 0)
-		return false;
-
-	static const char hex[] = "0123456789abcdef";
-	char buf[65];
-	for (int i = 0; i < 32; i++)
-	{
-		buf[i * 2] = hex[(mac[i] >> 4) & 0x0F];
-		buf[i * 2 + 1] = hex[mac[i] & 0x0F];
-	}
-	buf[64] = '\0';
-	outHex = String(buf);
-	return true;
-}
-
-bool publishFirmwareTelemetry(const char *eventName, const char *otaStatus, const String &targetVersion, const String &error)
-{
-	if (!WiFi.isConnected())
-		return false;
-	if (!timeReady())
-		return false;
-	if (!TELEMETRY_API_URL || !TELEMETRY_API_URL[0])
-		return false;
-	if (!TELEMETRY_API_TOKEN || !TELEMETRY_API_TOKEN[0])
-		return false;
-
-	StaticJsonDocument<256> doc;
-	doc["type"] = "device_telemetry";
-	doc["event"] = (eventName && eventName[0]) ? eventName : "firmware_report";
+	StaticJsonDocument<320> doc;
+	doc["type"] = "device_status";
+	doc["event"] = (eventName && eventName[0]) ? eventName : "status";
 	doc["deviceId"] = deviceId;
-	doc["fwVersion"] = FW_VERSION;
-
-	if (otaStatus && otaStatus[0])
-		doc["otaStatus"] = otaStatus;
+	doc["firmware"] = FW_VERSION;
+	doc["uptime"] = millis() / 1000UL;
+	doc["freeHeap"] = ESP.getFreeHeap();
+	doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : -999;
+	if (status && status[0])
+		doc["status"] = status;
 	if (targetVersion.length())
 		doc["targetVersion"] = targetVersion;
 	if (error.length())
 		doc["error"] = error;
 
 	String payload;
-	payload.reserve(220);
+	payload.reserve(280);
 	serializeJson(doc, payload);
-
-	auto postTelemetry = [&](const char *caCert, bool insecureMode) -> int
-	{
-		WiFiClientSecure client;
-		if (insecureMode)
-		{
-			client.setInsecure();
-		}
-		else if (caCert && caCert[0])
-		{
-			client.setCACert(caCert);
-		}
-		else
-		{
-			return -1;
-		}
-
-		HTTPClient http;
-		if (!http.begin(client, TELEMETRY_API_URL))
-		{
-			return -1;
-		}
-
-		http.addHeader("Content-Type", "application/json");
-		http.addHeader("x-device-telemetry-token", TELEMETRY_API_TOKEN);
-		int code = http.POST(payload);
-		http.end();
-		return code;
-	};
-
-	int code = -1;
-	if (TELEMETRY_TLS_INSECURE)
-	{
-		code = postTelemetry(nullptr, true);
-	}
-	else
-	{
-		// Strict TLS with pinned telemetry trust anchor.
-		code = postTelemetry(TELEMETRY_CA_CERT, false);
-	}
-
-	return code >= 200 && code < 300;
+	return mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
 }
 
-void performOtaUpdate(const String &url, const String &targetVersion)
+namespace
 {
-	static const unsigned long OTA_STATUS_HOLD_MS = 900;
-	static const unsigned long OTA_STATUS_HOLD_LONG_MS = 1300;
+/** Accept only the two release channels supported by the public manifest. */
+String normalizeOtaChannel(const String &value)
+{
+	String channel = value;
+	channel.trim();
+	channel.toLowerCase();
+	return channel == "preview" ? "preview" : String(NOTIFICATOR_OTA_DEFAULT_CHANNEL);
+}
 
-	String cleanUrl = url;
-	cleanUrl.trim();
-
-	if (!isValidOtaUrl(cleanUrl))
+/** Return true when value is exactly one lowercase SHA-256 hexadecimal digest. */
+bool isSha256Hex(const String &value)
+{
+	if (value.length() != 64)
+		return false;
+	for (size_t i = 0; i < value.length(); ++i)
 	{
-		drawCenteredText("OTA URL", "INVALID", 2);
-		publishFirmwareTelemetry("ota_result", "failed", targetVersion, "invalid_url");
-		flashOnboardLedColor(255, 40, 40, 120);
-		delay(OTA_STATUS_HOLD_LONG_MS);
+		const char c = value[i];
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+			return false;
+	}
+	return true;
+}
+
+/** Encode a 32-byte digest as lowercase hexadecimal without heap allocation. */
+String sha256ToHex(const unsigned char digest[32])
+{
+	static const char alphabet[] = "0123456789abcdef";
+	char output[65];
+	for (size_t i = 0; i < 32; ++i)
+	{
+		output[i * 2] = alphabet[(digest[i] >> 4) & 0x0f];
+		output[i * 2 + 1] = alphabet[digest[i] & 0x0f];
+	}
+	output[64] = '\0';
+	return String(output);
+}
+} // namespace
+
+/**
+ * Download and authenticate release metadata from the fixed official manifest.
+ *
+ * The manifest can be hosted publicly because authenticity comes from the
+ * embedded public key. The corresponding private key never reaches a device.
+ */
+bool fetchOfficialOtaRelease(const String &requestedChannel, OtaRelease &release, String &error)
+{
+	error = "";
+	const String channel = normalizeOtaChannel(requestedChannel);
+
+	WiFiClientSecure client;
+	client.setCACert(OTA_CA_CERT);
+	client.setTimeout(12000);
+
+	HTTPClient http;
+	http.setConnectTimeout(10000);
+	http.setTimeout(12000);
+	if (!http.begin(client, NOTIFICATOR_OTA_MANIFEST_URL))
+	{
+		error = "manifest_begin";
+		return false;
+	}
+
+	const int statusCode = http.GET();
+	if (statusCode != HTTP_CODE_OK)
+	{
+		error = "manifest_http_" + String(statusCode);
+		http.end();
+		return false;
+	}
+
+	const String body = http.getString();
+	http.end();
+	if (!body.length() || body.length() > 12288)
+	{
+		error = "manifest_size";
+		return false;
+	}
+
+	JsonDocument document;
+	const DeserializationError jsonError = deserializeJson(document, body);
+	if (jsonError)
+	{
+		error = "manifest_json";
+		return false;
+	}
+
+	const int schemaVersion = document["schemaVersion"] | 0;
+	JsonObject releaseJson =
+		document["channels"][channel.c_str()]["deviceTypes"][NOTIFICATOR_OTA_DEVICE_TYPE].as<JsonObject>();
+	if (schemaVersion != 2 || releaseJson.isNull())
+	{
+		error = "manifest_schema";
+		return false;
+	}
+
+	release.channel = channel;
+	release.deviceType = releaseJson["deviceType"] | "";
+	release.board = releaseJson["board"] | "";
+	release.version = releaseJson["version"] | "";
+	release.url = releaseJson["url"] | "";
+	release.sha256 = releaseJson["sha256"] | "";
+	release.size = releaseJson["size"] | 0;
+	release.releasedAt = releaseJson["releasedAt"] | "";
+	release.signature = releaseJson["signature"] | "";
+	release.keyId = releaseJson["keyId"] | "";
+
+	release.deviceType.trim();
+	release.board.trim();
+	release.version.trim();
+	release.url.trim();
+	release.sha256.trim();
+	release.sha256.toLowerCase();
+	release.releasedAt.trim();
+	release.signature.trim();
+	release.keyId.trim();
+
+	int major = 0;
+	int minor = 0;
+	int patch = 0;
+	const String algorithm = releaseJson["signatureAlgorithm"] | "";
+	if (release.deviceType != NOTIFICATOR_OTA_DEVICE_TYPE ||
+		release.board != NOTIFICATOR_OTA_BOARD ||
+		!parseVersionTriplet(release.version, major, minor, patch) ||
+		!isValidOtaUrl(release.url) ||
+		!isSha256Hex(release.sha256) ||
+		release.size == 0 ||
+		release.size > 1966080 ||
+		!release.releasedAt.length() ||
+		release.keyId != NOTIFICATOR_OTA_KEY_ID ||
+		algorithm != "ECDSA-P256-SHA256")
+	{
+		error = "manifest_fields";
+		return false;
+	}
+
+	const String signBase = buildOtaReleaseSignBase(
+		release.channel,
+		release.deviceType,
+		release.board,
+		release.version,
+		release.url,
+		release.sha256,
+		release.size,
+		release.releasedAt);
+	if (!verifyOtaReleaseSignature(
+			NOTIFICATOR_OTA_PUBLIC_KEY_PEM,
+			signBase,
+			release.signature))
+	{
+		error = "manifest_signature";
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Stream an authenticated release into the inactive OTA slot.
+ *
+ * SHA-256 is calculated while writing, before Update.end() marks the slot as
+ * bootable. This keeps memory use small and prevents a mismatched binary from
+ * becoming the next boot image.
+ */
+bool streamVerifiedOtaImage(const OtaRelease &release, String &error)
+{
+	error = "";
+	WiFiClientSecure client;
+	client.setCACert(OTA_CA_CERT);
+	client.setTimeout(12000);
+
+	HTTPClient http;
+	http.setConnectTimeout(10000);
+	http.setTimeout(12000);
+	if (!http.begin(client, release.url))
+	{
+		error = "binary_begin";
+		return false;
+	}
+
+	const int statusCode = http.GET();
+	if (statusCode != HTTP_CODE_OK)
+	{
+		error = "binary_http_" + String(statusCode);
+		http.end();
+		return false;
+	}
+
+	const int contentLength = http.getSize();
+	if (contentLength > 0 && static_cast<size_t>(contentLength) != release.size)
+	{
+		error = "binary_size";
+		http.end();
+		return false;
+	}
+
+	if (!Update.begin(release.size, U_FLASH))
+	{
+		error = "update_begin_" + String(Update.getError());
+		http.end();
+		return false;
+	}
+
+	mbedtls_sha256_context shaContext;
+	mbedtls_sha256_init(&shaContext);
+	if (mbedtls_sha256_starts(&shaContext, 0) != 0)
+	{
+		error = "sha_begin";
+		mbedtls_sha256_free(&shaContext);
+		Update.abort();
+		http.end();
+		return false;
+	}
+
+	WiFiClient *stream = http.getStreamPtr();
+	unsigned char buffer[1024];
+	size_t received = 0;
+	unsigned long lastDataAt = millis();
+	unsigned long lastDrawAt = 0;
+
+	while (received < release.size)
+	{
+		const int available = stream->available();
+		if (available <= 0)
+		{
+			if (!stream->connected() || millis() - lastDataAt > 12000)
+			{
+				error = "binary_timeout";
+				break;
+			}
+			delay(2);
+			continue;
+		}
+
+		const size_t remaining = release.size - received;
+		const size_t wanted = min(
+			remaining,
+			static_cast<size_t>(min(available, static_cast<int>(sizeof(buffer)))));
+		const size_t count = stream->readBytes(buffer, wanted);
+		if (!count)
+			continue;
+
+		lastDataAt = millis();
+		if (mbedtls_sha256_update(&shaContext, buffer, count) != 0)
+		{
+			error = "sha_update";
+			break;
+		}
+		if (Update.write(buffer, count) != count)
+		{
+			error = "update_write_" + String(Update.getError());
+			break;
+		}
+		received += count;
+
+		if (millis() - lastDrawAt >= 250)
+		{
+			lastDrawAt = millis();
+			const int percent = static_cast<int>((received * 100ULL) / release.size);
+			char percentText[8];
+			snprintf(percentText, sizeof(percentText), "%d%%", percent);
+			drawCenteredText("UPDATING", percentText, 2);
+		}
+	}
+
+	unsigned char digest[32];
+	const bool digestReady =
+		!error.length() &&
+		received == release.size &&
+		mbedtls_sha256_finish(&shaContext, digest) == 0;
+	mbedtls_sha256_free(&shaContext);
+
+	if (!digestReady)
+	{
+		if (!error.length())
+			error = "binary_incomplete";
+		Update.abort();
+		http.end();
+		return false;
+	}
+
+	const String actualSha256 = sha256ToHex(digest);
+	if (!otaSecureHexEquals(release.sha256, actualSha256))
+	{
+		error = "binary_hash";
+		Update.abort();
+		http.end();
+		return false;
+	}
+
+	if (!Update.end() || !Update.isFinished())
+	{
+		error = "update_end_" + String(Update.getError());
+		Update.abort();
+		http.end();
+		return false;
+	}
+
+	http.end();
+	return true;
+}
+
+/** Check the official channel and install a newer authenticated release. */
+void performOfficialOtaUpdate(const String &requestedChannel, bool force)
+{
+	const String channel = normalizeOtaChannel(requestedChannel);
+	drawCenteredText("OTA", "CHECKING", 2);
+	flashOnboardLedColor(60, 140, 255, 100);
+
+	OtaRelease release;
+	String error;
+	if (!fetchOfficialOtaRelease(channel, release, error))
+	{
+		drawCenteredText("OTA CHECK", "FAILED", 2);
+		publishDeviceStatus("ota_result", "failed", "", error);
+		flashOnboardLedColor(255, 40, 40, 140);
+		delay(1300);
 		return;
 	}
 
-	if (!isAllowedOtaHost(cleanUrl))
+	if (!force && !isRemoteVersionNewer(String(FW_VERSION), release.version))
 	{
-		drawCenteredText("OTA HOST", "DENIED", 2);
-		publishFirmwareTelemetry("ota_result", "failed", targetVersion, "host_denied");
-		flashOnboardLedColor(255, 40, 40, 120);
-		delay(OTA_STATUS_HOLD_LONG_MS);
+		drawCenteredText("OTA", "UP TO DATE", 2);
+		publishDeviceStatus("ota_result", "no_update", release.version, "");
+		flashOnboardLedColor(0, 200, 140, 100);
+		delay(1200);
 		return;
 	}
 
 	drawCenteredText("OTA", "STARTING", 2);
-	flashOnboardLedColor(60, 140, 255, 120);
-	delay(OTA_STATUS_HOLD_MS);
+	publishDeviceStatus("ota_result", "updating", release.version, "");
+	delay(500);
 
-	WiFiClientSecure client;
-	if (!OTA_CA_CERT || OTA_CA_CERT[0] == '\0')
+	if (!streamVerifiedOtaImage(release, error))
 	{
-		drawCenteredText("OTA TLS", "NO CERT", 2);
-		publishFirmwareTelemetry("ota_result", "failed", targetVersion, "missing_ca_cert");
-		flashOnboardLedColor(255, 40, 40, 120);
-		delay(OTA_STATUS_HOLD_LONG_MS);
-		return;
-	}
-	client.setCACert(OTA_CA_CERT);
-
-	// Reboot manually only after we confirm success and show feedback.
-	httpUpdate.rebootOnUpdate(false);
-
-	httpUpdate.onStart([]()
-					   { drawCenteredText("UPDATING", "FIRMWARE", 2); });
-
-	httpUpdate.onEnd([]()
-					 { drawCenteredText("OTA", "DONE", 2); });
-
-	httpUpdate.onProgress([](int cur, int total)
-						  {
-    static unsigned long lastProgressDrawMs = 0;
-    unsigned long now = millis();
-    if (now - lastProgressDrawMs < 250) return;
-    lastProgressDrawMs = now;
-
-    int pct = 0;
-    if (total > 0) pct = (cur * 100) / total;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-
-    char pctBuf[8];
-    snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-    drawCenteredText("UPDATING", pctBuf, 2); });
-
-	httpUpdate.onError([](int err)
-					   {
-    char errBuf[12];
-    snprintf(errBuf, sizeof(errBuf), "ERR %d", err);
-    drawCenteredText("OTA FAIL", errBuf, 2); });
-
-	t_httpUpdate_return ret = httpUpdate.update(client, cleanUrl);
-
-	if (ret == HTTP_UPDATE_FAILED)
-	{
-		int lastErr = httpUpdate.getLastError();
-
-		char errBuf[16];
-		snprintf(errBuf, sizeof(errBuf), "E%d", lastErr);
-		drawCenteredText("OTA FAIL", errBuf, 2);
-		publishFirmwareTelemetry("ota_result", "failed", targetVersion, String(errBuf));
-		delay(OTA_STATUS_HOLD_MS);
-
-		drawCenteredText("OTA FAIL", "TRY AGAIN", 2);
-		flashOnboardLedColor(255, 40, 40, 160);
-		delay(OTA_STATUS_HOLD_LONG_MS);
+		drawCenteredText("OTA", "FAILED", 2);
+		publishDeviceStatus("ota_result", "failed", release.version, error);
+		flashOnboardLedColor(255, 40, 40, 150);
+		delay(1400);
 		return;
 	}
 
-	if (ret == HTTP_UPDATE_NO_UPDATES)
-	{
-		drawCenteredText("OTA", "NO UPDATE", 2);
-		publishFirmwareTelemetry("ota_result", "no_update", targetVersion, "no_updates");
-		flashOnboardLedColor(240, 180, 30, 120);
-		delay(OTA_STATUS_HOLD_LONG_MS);
-		return;
-	}
-
-	// Success path: show clear feedback, then reboot.
 	drawCenteredText("OTA OK", "RESTARTING", 2);
-	publishFirmwareTelemetry("ota_result", "success", targetVersion, "");
-	delay(150);
+	publishDeviceStatus("ota_result", "success", release.version, "");
 	flashOnboardLedColor(0, 200, 140, 160);
-	delay(OTA_STATUS_HOLD_LONG_MS);
+	delay(1400);
 	ESP.restart();
 }
 
+/**
+ * Parse and execute a command received on this device's MQTT command topic.
+ *
+ * OTA commands select only a release channel. Trust decisions remain on the
+ * device and require an authenticated manifest plus a matching binary hash.
+ */
 void handleCmdJson(const String &json)
 {
 	StaticJsonDocument<512> doc;
@@ -2418,17 +2837,15 @@ void handleCmdJson(const String &json)
 
 	const char *cmd = doc["cmd"] | "";
 	int value = doc["value"] | -1;
-	const char *url = doc["url"] | "";
-	const char *remoteVersion = doc["version"] | "";
-	const char *sig = doc["sig"] | "";
-	unsigned long ts = doc["ts"] | 0;
+	const char *otaChannel = doc["channel"] | NOTIFICATOR_OTA_DEFAULT_CHANNEL;
 	bool forceOta = doc["force"] | false;
 
 	// Supported commands:
 	//  - idle_theme {value:0|1|2}
 	//  - clear_msgs
 	//  - mark_all_read
-	//  - ota {url:"https://...", version:"x.y.z", ts:unixSeconds, sig:hmacHex, force?:bool}
+	//  - weather_config {lat?, lon?, city?, timezone?}
+	//  - ota {channel:"stable"|"preview", force?:bool}
 
 	if (strcmp(cmd, "idle_theme") == 0 && (value == 0 || value == 1 || value == 2))
 	{
@@ -2554,170 +2971,108 @@ void handleCmdJson(const String &json)
 
 	if (strcmp(cmd, "ota") == 0)
 	{
-		if (!url || !url[0])
-		{
-			drawCenteredText("OTA URL", "MISSING", 2);
-			flashOnboardLedColor(255, 120, 0, 120);
-			delay(1100);
-			return;
-		}
-
-		if (!remoteVersion || !remoteVersion[0])
-		{
-			drawCenteredText("OTA VER", "MISSING", 2);
-			flashOnboardLedColor(255, 120, 0, 120);
-			delay(1100);
-			return;
-		}
-
-		if (!sig || !sig[0])
-		{
-			drawCenteredText("OTA SIG", "MISSING", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		if (ts == 0)
-		{
-			drawCenteredText("OTA TS", "MISSING", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		if (!timeReady())
-		{
-			drawCenteredText("OTA TIME", "UNSYNC", 2);
-			flashOnboardLedColor(255, 120, 0, 140);
-			delay(1100);
-			return;
-		}
-
-		long long nowSec = (long long)time(nullptr);
-		long long tsSec = (long long)ts;
-		long long skew = (nowSec > tsSec) ? (nowSec - tsSec) : (tsSec - nowSec);
-		if ((unsigned long)skew > OTA_TS_MAX_SKEW_SEC)
-		{
-			drawCenteredText("OTA TS", "EXPIRED", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		if (ts <= lastAcceptedOtaTs)
-		{
-			drawCenteredText("OTA", "REPLAY", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		String expectedSig;
-		String signBase = buildOtaSignBase(String(url), String(remoteVersion), ts, forceOta, deviceId);
-		if (!hmacSha256Hex(String(OTA_SHARED_TOKEN), signBase, expectedSig))
-		{
-			drawCenteredText("OTA SIG", "ERR", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		String providedSig = String(sig);
-		providedSig.trim();
-		providedSig.toLowerCase();
-		if (!providedSig.equals(expectedSig))
-		{
-			drawCenteredText("OTA SIG", "DENIED", 2);
-			flashOnboardLedColor(255, 40, 40, 140);
-			delay(1100);
-			return;
-		}
-
-		bool newer = isRemoteVersionNewer(String(FW_VERSION), String(remoteVersion));
-		if (!forceOta && !newer)
-		{
-			drawCenteredText("OTA", "NO UPDATE", 2);
-			flashOnboardLedColor(240, 180, 30, 120);
-			delay(1100);
-			return;
-		}
-
-		lastAcceptedOtaTs = ts;
-
-		performOtaUpdate(String(url), String(remoteVersion));
+		performOfficialOtaUpdate(String(otaChannel), forceOta);
 		return;
 	}
 }
 
 // -------------------- MQTT --------------------
+/**
+ * Configure the broker endpoint and normalize inbound MQTT payloads.
+ *
+ * Command messages are routed to handleCmdJson(). Notification messages accept
+ * either the structured JSON contract or the legacy pipe-delimited format.
+ */
 void setupMqttClient()
 {
-	mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+	if (!mqttConfigValid)
+		return;
+
+	mqttClient.setServer(mqttHost.c_str(), mqttPort);
 	mqttClient.setBufferSize(1024);
 
 	mqttClient.setCallback([](char *topic, uint8_t *payload, unsigned int length)
 						   {
-    String t = String(topic ? topic : "");
+		String receivedTopic = String(topic ? topic : "");
 
-    String raw;
-    raw.reserve(length + 1);
-    for (unsigned int i = 0; i < length; i++) raw += (char)payload[i];
+		String raw;
+		raw.reserve(length + 1);
+		for (unsigned int index = 0; index < length; index++)
+			raw += static_cast<char>(payload[index]);
 
-    if (mqttCmdTopic.length() && t == mqttCmdTopic) {
-      handleCmdJson(raw);
-      return;
-    }
+		if (mqttCmdTopic.length() && receivedTopic == mqttCmdTopic)
+		{
+			handleCmdJson(raw);
+			return;
+		}
 
-    receivingUntilMs = millis() + RECEIVING_BADGE_MS;
+		receivingUntilMs = millis() + RECEIVING_BADGE_MS;
 
-    String title = "";
-    String body = "";
-    String type = "";
-    String severity = "";
+		String title;
+		String body;
+		String type;
+		String severity;
 
-    StaticJsonDocument<1024> doc;
-    DeserializationError err = deserializeJson(doc, raw);
+		StaticJsonDocument<1024> doc;
+		DeserializationError error = deserializeJson(doc, raw);
 
-    if (!err && doc.is<JsonObject>()) {
-      JsonObject o = doc.as<JsonObject>();
-      if (o["title"].is<const char*>()) title = String((const char*)o["title"]);
-      if (o["body"].is<const char*>()) body = String((const char*)o["body"]);
-      if (o["type"].is<const char*>()) type = String((const char*)o["type"]);
-      if (o["severity"].is<const char*>()) severity = String((const char*)o["severity"]);
-    } else {
-      int first = raw.indexOf('|');
-      if (first >= 0) {
-        title = raw.substring(0, first);
-        String rest = raw.substring(first + 1);
-        int second = rest.indexOf('|');
-        if (second >= 0) {
-          body = rest.substring(0, second);
-          severity = rest.substring(second + 1);
-        } else {
-          body = rest;
-        }
-      } else {
-        body = raw;
-      }
-    }
+		if (!error && doc.is<JsonObject>())
+		{
+			JsonObject object = doc.as<JsonObject>();
+			if (object["title"].is<const char *>())
+				title = String(object["title"].as<const char *>());
+			if (object["body"].is<const char *>())
+				body = String(object["body"].as<const char *>());
+			if (object["type"].is<const char *>())
+				type = String(object["type"].as<const char *>());
+			if (object["severity"].is<const char *>())
+				severity = String(object["severity"].as<const char *>());
+		}
+		else
+		{
+			const int firstSeparator = raw.indexOf('|');
+			if (firstSeparator >= 0)
+			{
+				title = raw.substring(0, firstSeparator);
+				String remainder = raw.substring(firstSeparator + 1);
+				const int secondSeparator = remainder.indexOf('|');
+				if (secondSeparator >= 0)
+				{
+					body = remainder.substring(0, secondSeparator);
+					severity = remainder.substring(secondSeparator + 1);
+				}
+				else
+				{
+					body = remainder;
+				}
+			}
+			else
+			{
+				body = raw;
+			}
+		}
 
-    String payloadText;
-    payloadText.reserve(160);
-    if (title.length() && body.length()) payloadText = title + "|" + body;
-    else if (title.length()) payloadText = title;
-    else payloadText = body;
-    if (!payloadText.length()) payloadText = "(empty)";
+		String payloadText;
+		payloadText.reserve(160);
+		if (title.length() && body.length())
+			payloadText = title + "|" + body;
+		else if (title.length())
+			payloadText = title;
+		else
+			payloadText = body;
+		if (!payloadText.length())
+			payloadText = "(empty)";
 
-    String header = makeHeaderWithType(severity.length() ? severity : type);
+		const String header = makeHeaderWithType(severity.length() ? severity : type);
+		pushMessage(header, payloadText);
+		showCurrentMessage(false);
 
-    pushMessage(header, payloadText);
-    showCurrentMessage(false);
-    unsigned long now = millis();
-    if (now - lastMsgLedFlashMs >= MSG_LED_FLASH_COOLDOWN_MS) {
-      flashOnboardLedColor(0, 160, 255, 80);
-      lastMsgLedFlashMs = now;
-    } });
+		const unsigned long now = millis();
+		if (now - lastMsgLedFlashMs >= MSG_LED_FLASH_COOLDOWN_MS)
+		{
+			flashOnboardLedColor(0, 160, 255, 80);
+			lastMsgLedFlashMs = now;
+		} });
 
 	if (MQTT_USE_TLS && MQTT_CA_CERT[0] != '\0')
 	{
@@ -2725,15 +3080,23 @@ void setupMqttClient()
 	}
 }
 
+/**
+ * Attempt one authenticated MQTT connection and restore subscriptions.
+ *
+ * Retry cadence is controlled by loop(), so this function performs no delay
+ * and returns immediately when Wi-Fi or broker configuration is unavailable.
+ */
 void connectToMqtt()
 {
 	if (mqttClient.connected())
 		return;
 	if (!WiFi.isConnected())
 		return;
+	if (!mqttConfigValid)
+		return;
 
-	const String clientId = String("wpnotif-") + deviceId;
-	bool connected = mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
+	const String clientId = String("notificator-") + deviceId;
+	bool connected = mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
 
 	if (connected)
 	{
@@ -2741,46 +3104,28 @@ void connectToMqtt()
 			mqttClient.subscribe(mqttSubTopic.c_str(), 1);
 		if (mqttCmdTopic.length())
 			mqttClient.subscribe(mqttCmdTopic.c_str(), 1);
-		telemetryBootReportPending = true;
-		lastTelemetryRetryMs = 0;
+		publishDeviceStatus("online", "ready", "", "");
 		flashOnboardLedColor(0, 220, 160, 70);
 	}
 }
 
-// -------------------- Button handling --------------------
-// Gesture recognition model:
-// - Debounce each input source independently (button and TTP223).
-// - Merge into a single press/release stream.
-// - Resolve action on release (tap count, long hold, setup hold).
-// - Keep tap evaluation delayed until TAP_WINDOW_MS expires.
-static bool readButtonRawPressed()
-{
-	int buttonV = digitalRead(BUTTON_PIN);
-	return BUTTON_ACTIVE_LOW ? (buttonV == LOW) : (buttonV == HIGH);
-}
-
+// -------------------- Capacitive touch handling --------------------
 static bool readTtpRawPressed()
 {
 	int ttpV = digitalRead(TTP223_PIN);
 	return (ttpV != (int)ttpIdleLevel);
 }
 
-void handleButton()
+/**
+ * Sample the TTP223 and resolve tap/hold gestures without blocking the network
+ * loop. Gesture actions run only after a stable release.
+ */
+void handleTouchInput()
 {
-	// Debounce and merge both inputs into one gesture stream.
+	// The TTP223 is the only control on current devices. Actions are resolved
+	// after release so a tap cannot accidentally become a destructive hold.
 	unsigned long now = millis();
-	bool rawButton = readButtonRawPressed();
 	bool rawTtp = readTtpRawPressed();
-
-	if (rawButton != btnRawLast)
-	{
-		btnRawLast = rawButton;
-		btnRawChangedMs = now;
-	}
-	if ((now - btnRawChangedMs) >= BUTTON_DEBOUNCE_MS)
-	{
-		btnStable = rawButton;
-	}
 
 	if (rawTtp != ttpRawLast)
 	{
@@ -2792,42 +3137,27 @@ void handleButton()
 		ttpStable = rawTtp;
 	}
 
-	bool anyPressed = (btnStable || ttpStable);
-
-	if (!btnDown && anyPressed)
+	if (!touchDown && ttpStable)
 	{
-		btnDown = true;
-		btnDownMs = now;
+		touchDown = true;
+		touchDownMs = now;
 		holdPreviewActive = false;
 		holdPreviewMs = 0;
-		// Lock press ownership to the source(s) active at press start.
-		pressStartedByBtn = (btnStable || rawButton);
-		pressStartedByTtp = (ttpStable || rawTtp);
 		return;
 	}
 
-	if (btnDown)
+	if (touchDown)
 	{
-		bool stillPressed = false;
-		if (pressStartedByBtn)
-			stillPressed = stillPressed || btnStable;
-		if (pressStartedByTtp)
-			stillPressed = stillPressed || ttpStable;
-		if (!pressStartedByBtn && !pressStartedByTtp)
-			stillPressed = anyPressed;
-
-		if (stillPressed)
+		if (ttpStable)
 		{
-			unsigned long held = now - btnDownMs;
+			unsigned long held = now - touchDownMs;
 			holdPreviewMs = held;
 			holdPreviewActive = (held >= HOLD_PREVIEW_START_MS);
-			// While press is active, do not evaluate pending tap timeout yet.
 			return;
 		}
 
-		// Release for the same source that started the press.
-		btnDown = false;
-		unsigned long held = now - btnDownMs;
+		touchDown = false;
+		unsigned long held = now - touchDownMs;
 		holdPreviewActive = false;
 		holdPreviewMs = 0;
 
@@ -2842,8 +3172,6 @@ void handleButton()
 			resetTapSequence();
 			if (!portalRunning)
 				startSetupPortal();
-			pressStartedByBtn = false;
-			pressStartedByTtp = false;
 			bumpNoIdleGuard();
 			return;
 		}
@@ -2851,24 +3179,21 @@ void handleButton()
 		if (held >= BUTTON_LONG_PRESS_MS)
 		{
 			resetTapSequence();
-			clearAllMessagesAndShowFeedback();
-			pressStartedByBtn = false;
-			pressStartedByTtp = false;
+			markAllReadAndPersist();
 			return;
 		}
 
-		bool thisTapOnlyTtp = (pressStartedByTtp && !pressStartedByBtn);
 		if (!tapPending)
-			tapOnlyTtp = thisTapOnlyTtp;
-		else
-			tapOnlyTtp = (tapOnlyTtp && thisTapOnlyTtp);
+		{
+			tapSequenceStartedFromIdle =
+				(now - lastUserOrMsgMs) > IDLE_AFTER_MS &&
+				unreadCount() == 0 &&
+				(long)(now - noIdleUntilMs) >= 0;
+		}
 		tapCount++;
 		tapPending = true;
 		tapDeadlineMs = now + TAP_WINDOW_MS;
-		// Keep the UI out of idle while a gesture sequence is being evaluated.
 		bumpNoIdleGuard();
-		pressStartedByBtn = false;
-		pressStartedByTtp = false;
 		return;
 	}
 
@@ -2877,20 +3202,12 @@ void handleButton()
 		uint8_t c = tapCount;
 		tapCount = 0;
 		tapPending = false;
-		bool onlyTtp = tapOnlyTtp;
-		tapOnlyTtp = true;
-
-		if (onlyTtp && c >= TTP223_SETUP_TAP_COUNT)
-		{
-			startSetupPortal();
-			bumpNoIdleGuard();
-			return;
-		}
+		const bool startedFromIdle = tapSequenceStartedFromIdle;
+		tapSequenceStartedFromIdle = false;
 
 		// Gesture map (normal mode):
-		// 1 tap = mark read, 2 taps = next message, 3 taps = toggle read/unread,
-		// 4+ taps = show device id + firmware version.
-		// Note: 5+ TTP-only taps are handled above as setup trigger.
+		// 1 tap = wake or next message, 2 taps = toggle read/unread,
+		// 3 taps = device and connection info.
 		if (c >= SHOW_ID_TAP_COUNT)
 		{
 			showIdSticky = true;
@@ -2916,15 +3233,20 @@ void handleButton()
 				}
 				return;
 			}
-			markCurrentReadAndPersist();
+
+			if (!hasMessages())
+			{
+				showNoMessagesOverlay();
+				return;
+			}
+
+			if (startedFromIdle)
+				showCurrentMessage(false);
+			else
+				gotoNextMessage(false);
 			return;
 		}
 		if (c == 2)
-		{
-			gotoNextMessage(false);
-			return;
-		}
-		if (c == 3)
 		{
 			toggleCurrentReadStateAndPersist();
 			return;
@@ -2992,6 +3314,11 @@ void drawIdleHybridFrame()
 }
 
 // -------------------- Setup --------------------
+/**
+ * Initialize hardware, restore persistent state, and select setup or normal
+ * operation. Blocking work is limited to short boot feedback and fatal display
+ * initialization failure.
+ */
 void setup()
 {
 	Serial.begin(115200);
@@ -3003,20 +3330,15 @@ void setup()
 
 	setOnboardLed(false);
 
-	pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
 	pinMode(TTP223_PIN, INPUT);
 	delay(5);
 	ttpIdleLevel = (uint8_t)digitalRead(TTP223_PIN);
-
-	btnRawLast = readButtonRawPressed();
-	btnStable = btnRawLast;
-	btnRawChangedMs = millis();
 
 	ttpRawLast = readTtpRawPressed();
 	ttpStable = ttpRawLast;
 	ttpRawChangedMs = millis();
 
-	btnDown = false;
+	touchDown = false;
 	tapCount = 0;
 	tapPending = false;
 
@@ -3035,15 +3357,16 @@ void setup()
 	loadWeatherConfig();
 
 	deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
-	mqttSubTopic = String("devices/") + deviceId + String("/messages");
-	mqttCmdTopic = String("devices/") + deviceId + String("/cmd");
 	apSsid = String(WIFI_AP_PREFIX) + deviceId;
+	loadMqttConfig();
+	rebuildMqttTopics();
 
 	loadHistoryFromPrefs();
 	focusFirstUnreadIfAny();
 
+	configureSetupPortal();
 	{
-		std::vector<const char *> menu = {"wifi", "info", "exit"};
+		std::vector<const char *> menu = {"custom"};
 		wm.setMenu(menu);
 	}
 
@@ -3091,7 +3414,7 @@ void setup()
 		noIdleUntilMs = millis(); // allow immediately
 	}
 
-	if (deviceConfigured)
+	if (deviceConfigured && mqttConfigValid)
 	{
 		portalRunning = false;
 		drawCenteredText("STARTING", "DEVICE", 2);
@@ -3104,24 +3427,24 @@ void setup()
 }
 
 // -------------------- Loop --------------------
-/*
-  Main runtime state machine (evaluated in this order):
-  1) Always process local input and deferred history saves.
-  2) If WiFi is up, refresh time placeholders and weather cache.
-  3) If setup portal is active (and STA is down), keep portal UI alive and return.
-  4) If portal just completed (STA connected), finalize setup and return.
-  5) If configured but offline, run WiFi recovery/backoff and return.
-  6) If online, maintain MQTT session.
-  7) Render screen: device-id overlay > idle view eligibility > message view fallback.
-
-  The early returns intentionally isolate each state so modes do not overlap
-  (for example, portal drawing and normal message rendering).
-*/
+/**
+ * Run the cooperative device state machine.
+ *
+ * Evaluation order:
+ * 1. Process local input and deferred history saves.
+ * 2. Refresh time and weather data while Wi-Fi is available.
+ * 3. Service or finalize the setup portal.
+ * 4. Recover Wi-Fi and maintain the MQTT session.
+ * 5. Render the highest-priority OLED state.
+ *
+ * Early returns intentionally prevent setup, recovery, gesture feedback, and
+ * notification rendering from drawing over one another.
+ */
 void loop()
 {
 	unsigned long now = millis();
 
-	handleButton();
+	handleTouchInput();
 	maybeSaveHistory();
 
 	if (WiFi.isConnected())
@@ -3132,7 +3455,7 @@ void loop()
 	}
 
 	// Keep hold feedback visible and stable while the user is pressing.
-	if (holdPreviewActive && btnDown)
+	if (holdPreviewActive && touchDown)
 	{
 		drawHoldCounter(holdPreviewMs);
 		return;
@@ -3229,15 +3552,6 @@ void loop()
 	{
 		mqttClient.loop();
 
-		// If MQTT came up before NTP, retry the initial firmware report later.
-		if (telemetryBootReportPending && timeReady() && (now - lastTelemetryRetryMs >= TELEMETRY_RETRY_MS))
-		{
-			lastTelemetryRetryMs = now;
-			if (publishFirmwareTelemetry("firmware_report", nullptr, "", ""))
-			{
-				telemetryBootReportPending = false;
-			}
-		}
 	}
 
 	// ---------- Screen refresh (NO JUMPS + IDLE FIX) ----------
@@ -3257,6 +3571,13 @@ void loop()
 			drawNoMessagesScreen();
 			return;
 		}
+
+		if (uiFeedbackUntilMs > now)
+		{
+			drawGestureFeedback();
+			return;
+		}
+		uiFeedback = UiFeedback::None;
 
 		const bool idleTimeReached = (now - lastUserOrMsgMs) > IDLE_AFTER_MS;
 		const bool noUnread = (unreadCount() == 0);

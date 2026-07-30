@@ -1,0 +1,32 @@
+# Operating-system and editor metadata.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secret material.
+.env
+.env.*
+!.env.example
+.secrets/
+**/.secrets/
+*.key
+*.pem
+credentials.*
+secrets.*
+
+# Arduino and PlatformIO build output.
+**/build/
+**/.pio/
+**/.arduino/
+*.elf
+*.map
+*.bin
+*.hex
+*.uf2
+
+# Diagnostic output.
+*.log
+core
+core.*

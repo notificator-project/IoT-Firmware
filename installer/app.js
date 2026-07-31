@@ -125,6 +125,7 @@ function watchForCompletedInstall() {
 						.notificator-install-success-close { border: 0; border-radius: 999px; background: #2f69e8; color: white; cursor: pointer; font: inherit; font-weight: 750; padding: 10px 20px; }
 						.notificator-install-success-close:hover { background: #2458c7; }
 						.notificator-install-success-close:focus-visible { outline: 3px solid rgba(47, 105, 232, .35); outline-offset: 2px; }
+						.notificator-install-success-actions { justify-content: flex-start; }
 					`;
 					root.append(style);
 				}
@@ -132,6 +133,7 @@ function watchForCompletedInstall() {
 				const actions = root.querySelector('div[slot="actions"]');
 				const webToolsDialog = root.querySelector('ew-dialog');
 				if (actions && webToolsDialog) {
+					actions.classList.add('notificator-install-success-actions');
 					const close = document.createElement('button');
 					close.className = 'notificator-install-success-close';
 					close.type = 'button';

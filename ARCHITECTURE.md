@@ -22,6 +22,8 @@ The firmware avoids external web assets, a filesystem, and large display frame r
 - `models/notificator_base/portal_ui.h`: self-contained CSS for the captive setup portal
 - `models/notificator_base/partitions.csv`: 4 MB dual-OTA flash layout
 - `hardware/notificator_base/`: wiring and enclosure reference assets
+- `installer/`: static ESP Web Tools interface, firmware catalog, and model manifests
+- `scripts/prepare-web-installer.sh`: validates a merged build and assembles the deployable installer
 
 Each firmware target uses a stable machine-readable ID. The current target is
 `notificator_base`; the planned Matter target is `notificator_matter`. A model
@@ -215,6 +217,12 @@ result is published to the retained status topic before restart when possible.
 ## Flash Migration
 
 Application-only OTA does not rewrite an ESP32 partition table. Devices using the older 1.25 MB slot layout need one complete USB flash that includes `partitions.csv`. This is a one-time migration; subsequent firmware updates can use A/B OTA.
+
+The browser installer is the supported first-install and recovery path. Its
+manifest flashes a merged factory image at offset `0x0`; it must never reference
+the application-only OTA binary. The publishing workflow builds that image from
+the tagged source and deploys it with the installer, avoiding a mutable or
+third-party firmware download URL.
 
 ## Hardware Validation Checklist
 

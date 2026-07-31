@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="theme-color" content="#0a1020" />
+		<meta
+			name="description"
+			content="Install official Notificator firmware on a compatible ESP32 device from your browser."
+		/>
+		<title>Notificator Firmware Installer</title>
+		<link rel="stylesheet" href="./styles.css" />
+		<script
+			type="module"
+			src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"
+		></script>
+		<script type="module" src="./app.js"></script>
+	</head>
+	<body>
+		<a class="skip-link" href="#installer">Skip to the installer</a>
+
+		<main class="page-shell">
+			<header class="site-header" aria-label="Notificator firmware installer">
+				<a class="brand" href="https://notificator-project.com/" aria-label="Notificator Project home">
+					<span class="brand-mark" aria-hidden="true"></span>
+					<span>Notificator</span>
+				</a>
+				<a class="header-link" href="https://docs.notificator-project.com/">Documentation</a>
+			</header>
+
+			<section class="hero" aria-labelledby="page-title">
+				<p class="eyebrow">Open source device firmware</p>
+				<h1 id="page-title">Build your own Notificator.</h1>
+				<p class="hero-copy">
+					Connect a compatible ESP32 device over USB, choose its firmware, and install it securely from
+					your browser. No development environment is required.
+				</p>
+			</section>
+
+			<section class="installer-card" id="installer" aria-labelledby="installer-title">
+				<div class="card-heading">
+					<div>
+						<p class="step-label">Step 1</p>
+						<h2 id="installer-title">Choose a firmware</h2>
+					</div>
+					<span class="status-pill" id="release-status">Loading releases</span>
+				</div>
+
+				<label class="field-label" for="firmware-select">Device model</label>
+				<div class="select-wrap">
+					<select id="firmware-select" disabled>
+						<option>Loading available firmware…</option>
+					</select>
+				</div>
+
+				<div class="firmware-summary" id="firmware-summary" aria-live="polite">
+					<div>
+						<span>Board</span>
+						<strong id="firmware-board">Checking…</strong>
+					</div>
+					<div>
+						<span>Version</span>
+						<strong id="firmware-version">Checking…</strong>
+					</div>
+					<div>
+						<span>Channel</span>
+						<strong id="firmware-channel">Stable</strong>
+					</div>
+				</div>
+
+				<p class="firmware-description" id="firmware-description"></p>
+
+				<div class="install-section">
+					<div>
+						<p class="step-label">Step 2</p>
+						<h2>Connect and install</h2>
+					</div>
+
+					<esp-web-install-button id="install-button">
+						<button class="primary-button" slot="activate" type="button" disabled>
+							Connect device
+						</button>
+						<p class="compatibility-message" slot="unsupported">
+							This browser cannot access USB devices. Open this page in Chrome or Edge on a desktop
+							computer.
+						</p>
+						<p class="compatibility-message" slot="not-allowed">
+							The installer needs a secure HTTPS connection before it can access USB devices.
+						</p>
+					</esp-web-install-button>
+
+					<p class="install-warning">
+						<strong>This performs a clean installation.</strong> Saved Wi-Fi and MQTT settings on the device
+						will be erased. You can configure them again in the Notificator setup portal after restart.
+					</p>
+				</div>
+
+				<p class="error-message" id="installer-error" role="alert" hidden></p>
+			</section>
+
+			<section class="requirements" aria-labelledby="requirements-title">
+				<div>
+					<p class="eyebrow">Before you begin</p>
+					<h2 id="requirements-title">A three-minute setup</h2>
+				</div>
+				<ol class="requirements-list">
+					<li>
+						<span>01</span>
+						<div><strong>Use a data cable</strong><small>Some USB cables provide power only.</small></div>
+					</li>
+					<li>
+						<span>02</span>
+						<div><strong>Open Chrome or Edge</strong><small>Web Serial is not available in Safari or iOS browsers.</small></div>
+					</li>
+					<li>
+						<span>03</span>
+						<div><strong>Select the USB device</strong><small>Choose the ESP32 serial port when prompted.</small></div>
+					</li>
+					<li>
+						<span>04</span>
+						<div><strong>Complete local setup</strong><small>Join the WPNOTIF network after the device restarts.</small></div>
+					</li>
+				</ol>
+			</section>
+
+			<footer>
+				<p>Official open source firmware from the Notificator Project.</p>
+				<a href="https://github.com/notificator-project/IoT-Firmware">View the source</a>
+			</footer>
+		</main>
+	</body>
+</html>

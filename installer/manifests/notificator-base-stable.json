@@ -1,0 +1,19 @@
+{
+	"name": "Notificator Base",
+	"version": "1.1.0",
+	"funding_url": "https://buymeacoffee.com/vagelis",
+	"new_install_prompt_erase": false,
+	"new_install_improv_wait_time": 0,
+	"builds": [
+		{
+			"chipFamily": "ESP32-C3",
+			"improv": false,
+			"parts": [
+				{
+					"path": "../firmware/notificator-base-1.1.0.factory.bin",
+					"offset": 0
+				}
+			]
+		}
+	]
+}

@@ -7,6 +7,8 @@ models. The current target is **Notificator Base**; future hardware, including
 **Notificator Matter**, will live alongside it with independent builds and
 release channels.
 
+**[Open the firmware web installer](https://notificator-project.github.io/IoT-Firmware/)**
+
 The firmware is configurable locally, so Wi-Fi and HiveMQ credentials do not
 need to be committed to this public repository. OTA releases are authenticated
 with a public verification key; the private release key remains outside the
@@ -20,6 +22,8 @@ models/
   notificator_matter/     Reserved for the future Matter target
 hardware/
   notificator_base/       Wiring and enclosure references
+installer/                Browser-based USB firmware installer
+scripts/                  Release and installer assembly helpers
 ```
 
 Each model owns its hardware definition, build dependencies, embedded OTA
@@ -188,6 +192,42 @@ for the complete request and data-flow inventory.
 The model directory includes `partitions.csv`, a 4 MB dual-OTA layout with two `0x1E0000` application slots. The firmware does not use a flash filesystem, so that space is reserved for reliable A/B application updates.
 
 For a new device, or a device still using the older partition table, perform one USB flash of the complete build. A normal application-only OTA update cannot safely rewrite the flash partition table. After this one-time migration, future firmware binaries can use the signed HTTPS OTA flow.
+
+## Browser Installer
+
+The repository includes a catalog-driven [firmware web installer](installer/)
+powered by ESP Web Tools. It flashes the complete merged factory image, including
+the bootloader and partition table, so it can initialize a blank compatible
+device or recover one that cannot use OTA.
+
+The installer requires:
+
+- A desktop version of Chrome or Edge with Web Serial support
+- An HTTPS-hosted installer page
+- A USB data cable
+- A supported ESP32 board matching the selected firmware
+
+A browser installation erases saved device configuration. After installation,
+open the local `WPNOTIF-<deviceId>` setup network and enter Wi-Fi and HiveMQ
+details again. Once setup is complete, future releases should normally be
+installed through the firmware's authenticated OTA flow.
+
+GitHub Actions compiles the current Notificator Base source, verifies that the
+output is a complete merged image, assembles the static installer, and deploys
+it to GitHub Pages. Generated binaries remain build artifacts and are not
+committed to the repository.
+
+To prepare the installer locally after an Arduino CLI build:
+
+```bash
+scripts/prepare-web-installer.sh \
+  build/notificator-base/notificator_base.ino.merged.bin \
+  build/web-installer
+```
+
+Firmware choices are defined in `installer/firmware-catalog.json`. Each choice
+points to an ESP Web Tools manifest in `installer/manifests/`, making additional
+models and release channels independently selectable.
 
 In Arduino IDE use:
 

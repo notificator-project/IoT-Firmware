@@ -26,6 +26,7 @@ function createInstallSuccessPanel() {
 	const release = releases.find((item) => item.id === elements.select.value) || releases[0];
 	const panel = document.createElement('section');
 	panel.className = 'notificator-install-success';
+	panel.slot = 'content';
 	panel.dataset.notificatorInstallSuccess = 'true';
 	panel.setAttribute('aria-labelledby', 'notificator-install-success-title');
 	panel.setAttribute('aria-live', 'polite');

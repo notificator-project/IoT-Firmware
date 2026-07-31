@@ -137,7 +137,7 @@ the most recently published device state:
   "type": "device_status",
   "event": "online",
   "deviceId": "abc123",
-  "firmware": "1.1.0",
+  "firmware": "1.1.1",
   "uptime": 120,
   "freeHeap": 286044,
   "rssi": -58,

@@ -291,8 +291,8 @@ Current firmware metadata in source:
 - Model ID: `notificator_base`
 - Board ID: `esp32c3-supermini-oled`
 - Firmware name: `Notificator Base Firmware`
-- Firmware version: `1.1.0`
-- Firmware date: `2026-07-30`
+- Firmware version: `1.1.1`
+- Firmware date: `2026-07-31`
 
 ## License
 

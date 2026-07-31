@@ -52,15 +52,15 @@ hr{height:1px;margin:26px 0;border:0;background:var(--line)}
 .network-advanced>label,.network-advanced>input{margin-right:20px!important;margin-left:20px!important}
 .network-advanced>input{width:calc(100% - 40px)}
 .network-advanced>br{display:none}
-.wifi-network{display:grid;grid-template-columns:minmax(0,1fr) 46px;align-items:center;min-height:48px;margin:7px 0;border:1px solid var(--line);border-radius:14px;background:#fff;overflow:hidden}
+.wifi-network{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;min-height:48px;margin:7px 0;border:1px solid var(--line);border-radius:14px;background:#fff;overflow:hidden}
 .wifi-network:hover{border-color:#93b4ff;background:#f8fbff}
 .wifi-network a[data-ssid]{display:flex;align-items:center;align-self:stretch;min-width:0;padding:0 13px;color:var(--ink);font-size:14px;text-decoration:none}
-.wifi-network .q{display:flex!important;float:none!important;align-items:center;justify-content:flex-end;gap:4px;width:auto!important;min-width:0!important;height:18px!important;margin:0 11px 0 0!important;padding:0!important}
-.wifi-network .q:before,.wifi-network .q:after{display:block!important;width:16px!important;height:16px!important;padding:0!important;background-color:var(--blue)!important;background-image:none!important;background-position:initial!important;background-repeat:no-repeat!important;content:""!important}
-.wifi-network .q:after{-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 18.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0-5c-2.15 0-4.12.8-5.62 2.12l1.55 1.76A6.1 6.1 0 0 1 12 15.85c1.56 0 2.99.58 4.07 1.53l1.55-1.76A8.48 8.48 0 0 0 12 13.5Zm0-5c-3.4 0-6.5 1.28-8.84 3.38l1.56 1.74A10.82 10.82 0 0 1 12 10.85c2.8 0 5.35 1.05 7.28 2.77l1.56-1.74A13.15 13.15 0 0 0 12 8.5Zm0-5C7.3 3.5 3.03 5.27 0 8.16L1.6 9.85A14.96 14.96 0 0 1 12 5.85c4.04 0 7.72 1.51 10.4 4l1.6-1.69A17.3 17.3 0 0 0 12 3.5Z'/%3E%3C/svg%3E") center/contain no-repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 18.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0-5c-2.15 0-4.12.8-5.62 2.12l1.55 1.76A6.1 6.1 0 0 1 12 15.85c1.56 0 2.99.58 4.07 1.53l1.55-1.76A8.48 8.48 0 0 0 12 13.5Zm0-5c-3.4 0-6.5 1.28-8.84 3.38l1.56 1.74A10.82 10.82 0 0 1 12 10.85c2.8 0 5.35 1.05 7.28 2.77l1.56-1.74A13.15 13.15 0 0 0 12 8.5Zm0-5C7.3 3.5 3.03 5.27 0 8.16L1.6 9.85A14.96 14.96 0 0 1 12 5.85c4.04 0 7.72 1.51 10.4 4l1.6-1.69A17.3 17.3 0 0 0 12 3.5Z'/%3E%3C/svg%3E") center/contain no-repeat}
-.wifi-network .q.l:before{-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V6Z'/%3E%3C/svg%3E") center/contain no-repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M17 8h-1V6a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Zm-7-2a2 2 0 1 1 4 0v2h-4V6Z'/%3E%3C/svg%3E") center/contain no-repeat}
-.wifi-network .q:not(.l):before{display:none!important}
-.wifi-network .q.q-0:after{opacity:.25}.wifi-network .q.q-1:after{opacity:.42}.wifi-network .q.q-2:after{opacity:.62}.wifi-network .q.q-3:after{opacity:.8}
+.wifi-network>.q{display:none!important}
+.wifi-network-meta{display:flex;align-items:center;justify-content:flex-end;gap:5px;min-width:max-content;margin-right:12px;color:var(--muted);font-size:12px;font-weight:700;line-height:1}
+.wifi-network-meta svg{display:block;width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.wifi-network-meta .wifi-signal{color:var(--blue)}
+.wifi-network-meta.q-0 .wifi-signal{opacity:.28}.wifi-network-meta.q-1 .wifi-signal{opacity:.45}.wifi-network-meta.q-2 .wifi-signal{opacity:.64}.wifi-network-meta.q-3 .wifi-signal{opacity:.82}
+.wifi-network-meta .wifi-lock{width:14px;height:14px;color:#64748b}
 .D{color:var(--danger)}
 .c{text-align:left}
 .footer-note{margin:22px 0 0;color:var(--muted);font-size:12px;line-height:1.5;text-align:center}
@@ -87,8 +87,37 @@ foot.className="footer-note";
 foot.textContent="Your credentials stay on this device or WordPress site. Notificator does not provide an MQTT broker.";
 wrap.appendChild(foot);
 }
+function portalIcon(type){
+var ns="http://www.w3.org/2000/svg";
+var svg=document.createElementNS(ns,"svg");
+var path=document.createElementNS(ns,"path");
+svg.setAttribute("viewBox","0 0 24 24");
+svg.setAttribute("aria-hidden","true");
+svg.setAttribute("focusable","false");
+svg.setAttribute("class",type==="lock"?"wifi-lock":"wifi-signal");
+path.setAttribute("d",type==="lock"?"M8 10V7.5a4 4 0 0 1 8 0V10M6.5 10h11v10h-11z":"M3 9a13 13 0 0 1 18 0M6.5 12.5a8 8 0 0 1 11 0M10 16a3 3 0 0 1 4 0M12 20h.01");
+svg.appendChild(path);
+return svg;
+}
 document.querySelectorAll("a[data-ssid]").forEach(function(link){
-if(link.parentElement)link.parentElement.classList.add("wifi-network");
+var row=link.parentElement;
+if(!row)return;
+var signal=row.querySelector(".q[role='img']");
+var percentage=row.querySelector(".q:not([role='img'])");
+var secured=!!(signal&&signal.classList.contains("l"));
+var strength=percentage&&percentage.textContent?percentage.textContent.trim():(signal&&signal.getAttribute("aria-label")||"");
+var quality="q-4";
+["q-0","q-1","q-2","q-3","q-4"].some(function(name){if(signal&&signal.classList.contains(name)){quality=name;return true;}return false;});
+var meta=document.createElement("span");
+meta.className="wifi-network-meta "+quality;
+meta.setAttribute("role","img");
+meta.setAttribute("aria-label",(strength?strength+", ":"")+(secured?"secured network":"open network"));
+if(strength&&!(percentage&&percentage.classList.contains("h"))){var value=document.createElement("span");value.textContent=strength;meta.appendChild(value);}
+meta.appendChild(portalIcon("wifi"));
+if(secured)meta.appendChild(portalIcon("lock"));
+row.querySelectorAll(".q").forEach(function(item){item.remove();});
+row.appendChild(meta);
+row.classList.add("wifi-network");
 });
 var firstStaticLabel=document.querySelector("label[for='ip']");
 if(firstStaticLabel){

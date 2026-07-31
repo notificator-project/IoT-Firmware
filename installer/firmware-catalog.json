@@ -5,7 +5,7 @@
 			"id": "notificator-base-stable",
 			"name": "Notificator Base",
 			"board": "ESP32-C3 SuperMini + OLED",
-			"version": "1.1.0",
+			"version": "1.1.1",
 			"channel": "Stable",
 			"badge": "Ready to install",
 			"description": "The standard Notificator firmware for an ESP32-C3 SuperMini, a 128 × 64 SSD1306 OLED, and a TTP223 capacitive touch sensor.",

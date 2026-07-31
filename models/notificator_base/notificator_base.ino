@@ -40,8 +40,8 @@
  * release behavior changes.
  */
 #define FW_NAME "Notificator Base Firmware"
-#define FW_VERSION "1.1.0"
-#define FW_VERSION_DATE "2026-07-30"
+#define FW_VERSION "1.1.1"
+#define FW_VERSION_DATE "2026-07-31"
 
 /*
   Notificator Base ESP32-C3 firmware

@@ -268,6 +268,14 @@ Publish compiled binaries as release artifacts rather than committing generated
 build output. OTA manifest entries and URLs must always use the corresponding
 model ID and board ID.
 
+To publish an official version, update the source and installer metadata, then
+publish a matching `vX.Y.Z` GitHub release. The firmware workflow compiles the
+source, deploys the web installer, and attaches versioned OTA and factory
+binaries to the release. The private API repository's manually started
+**Publish signed firmware** workflow then downloads that OTA asset and signs
+the public release manifest inside its protected `firmware-production`
+environment. The private signing key never belongs in this repository.
+
 The firmware is split by responsibility:
 
 - `models/notificator_base/notificator_base.ino` owns the Notificator Base hardware and runtime state machines.

@@ -14,11 +14,11 @@ static const char NOTIFICATOR_OTA_DEVICE_TYPE[] = "notificator_base";
 static const char NOTIFICATOR_OTA_BOARD[] = "esp32c3-supermini-oled";
 static const char NOTIFICATOR_OTA_DEFAULT_CHANNEL[] = "stable";
 static const char NOTIFICATOR_OTA_KEY_ID[] =
-	"sha256:d015c69ecc6f1830eac13198232df9a0ca54032ae5bab25842b91c0950485dcb";
+	"sha256:9eb7eb4a95ad4be2f53d1039036dc68942c74fb00d807c1d81d4c35d04b8be50";
 
 static const char NOTIFICATOR_OTA_PUBLIC_KEY_PEM[] = R"PEM(
 -----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEXIC8/LJ2F3wRHY8I81NKStGHMiUd
-guQGUShJJZvJxgxjSOdYcvSkE/LbA2mMOrf5xTEUDvZn210NsES+4pmUGw==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAETfjcX6PYc0Pcgv7Oa69jcO30f2xy
+6gNu4vycZbUPYoZRnDrNHqxogRC8oVsZON+ZjZyEl3XsPwxCgMcguoaeVA==
 -----END PUBLIC KEY-----
 )PEM";

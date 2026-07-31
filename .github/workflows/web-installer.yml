@@ -7,7 +7,7 @@ on:
       - published
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -60,6 +60,29 @@ jobs:
             --fqbn "$FQBN" \
             --output-dir build/notificator-base \
             models/notificator_base
+
+      - name: Prepare versioned release assets
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          cp build/notificator-base/notificator_base.ino.bin \
+            "build/notificator-base/notificator-base-${version}.ota.bin"
+          cp build/notificator-base/notificator_base.ino.merged.bin \
+            "build/notificator-base/notificator-base-${version}.factory.bin"
+
+      - name: Attach firmware binaries to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" \
+            "build/notificator-base/notificator-base-${version}.ota.bin" \
+            "build/notificator-base/notificator-base-${version}.factory.bin" \
+            --clobber
 
       - name: Assemble web installer
         run: |

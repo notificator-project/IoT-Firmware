@@ -40,8 +40,8 @@
  * release behavior changes.
  */
 #define FW_NAME "Notificator Base Firmware"
-#define FW_VERSION "1.1.1"
-#define FW_VERSION_DATE "2026-07-31"
+#define FW_VERSION "1.2.0"
+#define FW_VERSION_DATE "2026-08-01"
 
 /*
   Notificator Base ESP32-C3 firmware
@@ -2440,8 +2440,10 @@ void drawIdleWeatherFrame()
 /**
  * Publish retained device health and OTA lifecycle information.
  *
- * Core fields are always included. Status, targetVersion, and error are added
- * only when supplied by the caller.
+ * The payload follows the authenticated telemetry bridge contract consumed by
+ * the API. OTA lifecycle states use otaStatus; ordinary health reports use
+ * status. The firmware version is reported on every event so a successful
+ * reboot can close an in-flight update in the database.
  *
  * @return false when MQTT is unavailable or publish fails.
  */
@@ -2451,15 +2453,20 @@ bool publishDeviceStatus(const char *eventName, const char *status, const String
 		return false;
 
 	StaticJsonDocument<320> doc;
-	doc["type"] = "device_status";
+	doc["type"] = "device_telemetry";
 	doc["event"] = (eventName && eventName[0]) ? eventName : "status";
 	doc["deviceId"] = deviceId;
-	doc["firmware"] = FW_VERSION;
+	doc["firmwareVersion"] = FW_VERSION;
 	doc["uptime"] = millis() / 1000UL;
 	doc["freeHeap"] = ESP.getFreeHeap();
 	doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : -999;
 	if (status && status[0])
-		doc["status"] = status;
+	{
+		if (eventName && strcmp(eventName, "ota_result") == 0)
+			doc["otaStatus"] = status;
+		else
+			doc["status"] = status;
+	}
 	if (targetVersion.length())
 		doc["targetVersion"] = targetVersion;
 	if (error.length())
@@ -2815,7 +2822,9 @@ void performOfficialOtaUpdate(const String &requestedChannel, bool force)
 	}
 
 	drawCenteredText("OTA OK", "RESTARTING", 2);
-	publishDeviceStatus("ota_result", "success", release.version, "");
+	// Keep the API state in progress until the new image boots and reports its
+	// own FW_VERSION. Reporting success here would still carry the old version.
+	publishDeviceStatus("ota_result", "restarting", release.version, "");
 	flashOnboardLedColor(0, 200, 140, 160);
 	delay(1400);
 	ESP.restart();

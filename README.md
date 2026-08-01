@@ -291,6 +291,10 @@ and MQTT paths before they have been validated together on physical hardware.
 
 On first boot, configure the HiveMQ connection in the local setup portal.
 Official OTA updates require no device-specific update secret or hostname.
+Firmware `1.2.0` is the minimum version accepted by the device API. Older
+devices can receive an authenticated OTA command, but ordinary commands and
+MQTT notification delivery remain blocked until the device reports `1.2.0` or
+newer.
 
 ## Version Info
 
@@ -299,8 +303,8 @@ Current firmware metadata in source:
 - Model ID: `notificator_base`
 - Board ID: `esp32c3-supermini-oled`
 - Firmware name: `Notificator Base Firmware`
-- Firmware version: `1.1.1`
-- Firmware date: `2026-07-31`
+- Firmware version: `1.2.0`
+- Firmware date: `2026-08-01`
 
 ## License
 

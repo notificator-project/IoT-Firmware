@@ -134,10 +134,10 @@ the most recently published device state:
 
 ```json
 {
-  "type": "device_status",
+  "type": "device_telemetry",
   "event": "online",
   "deviceId": "abc123",
-  "firmware": "1.1.1",
+  "firmwareVersion": "1.2.0",
   "uptime": 120,
   "freeHeap": 286044,
   "rssi": -58,
@@ -145,7 +145,8 @@ the most recently published device state:
 }
 ```
 
-OTA lifecycle messages can additionally contain `targetVersion` and `error`.
+OTA lifecycle messages additionally use `otaStatus` and can contain
+`targetVersion` and `error`.
 The exact heap and signal values above are illustrative.
 
 ## External Network Requests

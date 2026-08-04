@@ -3,9 +3,9 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 This repository is the home of firmware for official Notificator hardware
-models. The current target is **Notificator Base**; future hardware, including
-**Notificator Matter**, will live alongside it with independent builds and
-release channels.
+models. **Notificator Base** is the stable target and **Notificator Touch 3.49**
+is in active hardware and interface development. Future hardware, including
+**Notificator Matter**, will use independent builds and release channels.
 
 **[Open the firmware web installer](https://notificator-project.github.io/IoT-Firmware/)**
 
@@ -18,15 +18,17 @@ Repository layout:
 
 ```text
 models/
-  notificator_base/       Current ESP32-C3 firmware target
-  notificator_matter/     Reserved for the future Matter target
+  notificator_base/                 ESP32-C3 OLED firmware target
+  notificator_touch_349/            ESP32-S3 touch firmware target
+  notificator_touch_349_diagnostic/ Hardware-validation target
+  notificator_matter/               Reserved for the future Matter target
 hardware/
   notificator_base/       Wiring and enclosure references
 installer/                Browser-based USB firmware installer
 scripts/                  Release and installer assembly helpers
 ```
 
-Each model owns its hardware definition, build dependencies, embedded OTA
+Each production model owns its hardware definition, build dependencies, embedded OTA
 verification key, and release artifacts. Code should move into a shared module
 only after two model implementations genuinely use it.
 

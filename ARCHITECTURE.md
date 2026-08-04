@@ -17,6 +17,8 @@ The firmware avoids external web assets, a filesystem, and large display frame r
 ## Source Layout
 
 - `models/notificator_base/notificator_base.ino`: Notificator Base runtime state, OLED rendering, Wi-Fi recovery, MQTT delivery, message history, commands, and the Arduino `setup()`/`loop()`
+- `models/notificator_touch_349/notificator_touch_349.ino`: Notificator Touch 3.49 hardware runtime and model-specific 640 × 172 interface
+- `models/notificator_touch_349_diagnostic/`: isolated display, touch, IMU, audio, and physical-button validation firmware
 - `models/notificator_base/ota_release_config.h`: official manifest endpoint, model identity, and public verification key
 - `models/notificator_base/ota_security.h` and `models/notificator_base/ota_security.cpp`: strict version parsing, canonical release payloads, and ECDSA signature verification
 - `models/notificator_base/portal_ui.h`: self-contained CSS for the captive setup portal
@@ -25,8 +27,9 @@ The firmware avoids external web assets, a filesystem, and large display frame r
 - `installer/`: static ESP Web Tools interface, firmware catalog, and model manifests
 - `scripts/prepare-web-installer.sh`: validates a merged build and assembles the deployable installer
 
-Each firmware target uses a stable machine-readable ID. The current target is
-`notificator_base`; the planned Matter target is `notificator_matter`. A model
+Each firmware target uses a stable machine-readable ID. Current model IDs are
+`notificator_base` and the in-development `notificator_touch_349`; the planned
+Matter target is `notificator_matter`. A model
 gets an independent sketch and OTA release entry rather than compile-time
 branches inside another model's firmware.
 

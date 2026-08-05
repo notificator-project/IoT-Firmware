@@ -1,16 +1,16 @@
 {
-	"name": "Notificator Base",
-	"version": "1.2.1",
+	"name": "Notificator Touch 3.49",
+	"version": "0.9.1",
 	"funding_url": "https://buymeacoffee.com/vagelis",
 	"new_install_prompt_erase": false,
 	"new_install_improv_wait_time": 0,
 	"builds": [
 		{
-			"chipFamily": "ESP32-C3",
+			"chipFamily": "ESP32-S3",
 			"improv": false,
 			"parts": [
 				{
-					"path": "../firmware/notificator-base-1.2.1.factory.bin",
+					"path": "../firmware/notificator-touch-349-0.9.1.factory.bin",
 					"offset": 0
 				}
 			]

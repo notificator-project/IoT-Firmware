@@ -40,8 +40,8 @@
  * release behavior changes.
  */
 #define FW_NAME "Notificator Base Firmware"
-#define FW_VERSION "1.2.0"
-#define FW_VERSION_DATE "2026-08-01"
+#define FW_VERSION "1.2.1"
+#define FW_VERSION_DATE "2026-08-05"
 
 /*
   Notificator Base ESP32-C3 firmware
@@ -283,6 +283,7 @@ Preferences prefs;
 // -------------------- Remote / UI state --------------------
 // 0 = clock (default), 1 = weather+clock hybrid, 2 = weather
 uint8_t idleTheme = 0;
+uint8_t screenBrightnessPercent = 80;
 
 // prevent idle UI jumps right after actions/messages
 static const unsigned long NO_IDLE_AFTER_ACTION_MS = 2000;
@@ -494,6 +495,8 @@ const char *weatherCodeToShort(uint8_t code);
 // commands
 void loadIdleTheme();
 void saveIdleTheme(uint8_t v);
+void loadDisplayBrightness();
+void saveDisplayBrightness(uint8_t value);
 void loadWeatherConfig();
 void saveWeatherConfig(bool manual);
 void handleCmdJson(const String &json);
@@ -825,6 +828,27 @@ void saveIdleTheme(uint8_t v)
 	lastWeatherFetchMs = 0;
 	weatherHasData = false;
 	weatherFetching = false;
+}
+
+/** Restore and apply the OLED contrast level selected in the mobile app. */
+void loadDisplayBrightness()
+{
+	prefs.begin("wpnotif", true);
+	screenBrightnessPercent = constrain(prefs.getUChar("brightness", 80), 10, 100);
+	prefs.end();
+	display.ssd1306_command(SSD1306_SETCONTRAST);
+	display.ssd1306_command(map(screenBrightnessPercent, 10, 100, 16, 255));
+}
+
+/** Persist a bounded contrast value while retaining a usable minimum. */
+void saveDisplayBrightness(uint8_t value)
+{
+	screenBrightnessPercent = constrain(value, 10, 100);
+	display.ssd1306_command(SSD1306_SETCONTRAST);
+	display.ssd1306_command(map(screenBrightnessPercent, 10, 100, 16, 255));
+	prefs.begin("wpnotif", false);
+	prefs.putUChar("brightness", screenBrightnessPercent);
+	prefs.end();
 }
 
 void loadWeatherConfig()
@@ -2851,6 +2875,7 @@ void handleCmdJson(const String &json)
 
 	// Supported commands:
 	//  - idle_theme {value:0|1|2}
+	//  - screen_brightness {value:0..100}
 	//  - clear_msgs
 	//  - mark_all_read
 	//  - weather_config {lat?, lon?, city?, timezone?}
@@ -2870,6 +2895,15 @@ void handleCmdJson(const String &json)
 		flashOnboardLedColor(40, 120, 255, 40);
 		lastUserOrMsgMs = millis() - (IDLE_AFTER_MS + 1000);
 		noIdleUntilMs = millis();
+		return;
+	}
+
+	if (strcmp(cmd, "screen_brightness") == 0 && value >= 0 && value <= 100)
+	{
+		saveDisplayBrightness((uint8_t)max(10, value));
+		const String brightnessLabel = String(screenBrightnessPercent) + "%";
+		drawCenteredText("DISPLAY", brightnessLabel.c_str(), 2);
+		bumpNoIdleGuard();
 		return;
 	}
 
@@ -3357,6 +3391,7 @@ void setup()
 		while (true)
 			delay(1000);
 	}
+	loadDisplayBrightness();
 
 	drawBootWelcomeScreen();
 	delay(1200);

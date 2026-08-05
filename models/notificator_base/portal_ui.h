@@ -109,7 +109,10 @@ var strength=percentage&&percentage.textContent?percentage.textContent.trim():(s
 var quality="q-4";
 ["q-0","q-1","q-2","q-3","q-4"].some(function(name){if(signal&&signal.classList.contains(name)){quality=name;return true;}return false;});
 var meta=document.createElement("span");
-meta.className="wifi-network-meta "+quality;
+// WiFiManager's c(this) handler checks the selected link's next sibling for
+// its `l` security marker before enabling the Wi-Fi password input. Preserve
+// that marker when replacing the stock signal elements with our metadata UI.
+meta.className="wifi-network-meta "+quality+(secured?" l":"");
 meta.setAttribute("role","img");
 meta.setAttribute("aria-label",(strength?strength+", ":"")+(secured?"secured network":"open network"));
 if(strength&&!(percentage&&percentage.classList.contains("h"))){var value=document.createElement("span");value.textContent=strength;meta.appendChild(value);}

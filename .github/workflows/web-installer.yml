@@ -1,4 +1,4 @@
-name: Publish firmware web installer
+name: Publish firmware release and web installer
 
 on:
   workflow_dispatch:
@@ -12,13 +12,16 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  # Two model releases may be published back-to-back. Serialize their shared
+  # GitHub Pages deployment instead of allowing competing installer uploads.
+  group: firmware-release-and-pages
+  cancel-in-progress: false
 
 env:
   ESP32_PACKAGE_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
   ESP32_CORE_VERSION: 3.3.8
-  FQBN: esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M
+  BASE_FQBN: esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M
+  TOUCH_FQBN: esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=qio
 
 jobs:
   build:
@@ -27,15 +30,34 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Verify release version
-        if: github.event_name == 'release'
+      - name: Resolve release target
         env:
+          EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          source_version="$(sed -n 's/^#define FW_VERSION "\([^"]*\)"/\1/p' models/notificator_base/notificator_base.ino)"
-          release_version="${RELEASE_TAG#v}"
-          if [[ "$source_version" != "$release_version" ]]; then
-            echo "Release tag $RELEASE_TAG does not match firmware version $source_version." >&2
+          target=""
+          version=""
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            case "$RELEASE_TAG" in
+              base-v*) target="notificator-base"; version="${RELEASE_TAG#base-v}" ;;
+              touch-v*) target="notificator-touch-349"; version="${RELEASE_TAG#touch-v}" ;;
+              v*) target="notificator-base"; version="${RELEASE_TAG#v}" ;;
+              *) echo "Unsupported firmware release tag: $RELEASE_TAG" >&2; exit 64 ;;
+            esac
+          fi
+          echo "RELEASE_TARGET=$target" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Verify release version
+        if: github.event_name == 'release'
+        run: |
+          if [[ "$RELEASE_TARGET" == "notificator-base" ]]; then
+            source_version="$(sed -n 's/^#define FW_VERSION "\([^"]*\)"/\1/p' models/notificator_base/notificator_base.ino)"
+          else
+            source_version="$(sed -n 's/^constexpr char FIRMWARE_VERSION\[\] = "\([^"]*\)";/\1/p' models/notificator_touch_349/notificator_touch_349.ino)"
+          fi
+          if [[ "$source_version" != "$RELEASE_VERSION" ]]; then
+            echo "Release version $RELEASE_VERSION does not match $RELEASE_TARGET source version $source_version." >&2
             exit 1
           fi
 
@@ -51,26 +73,35 @@ jobs:
             "PubSubClient@2.8" \
             "ArduinoJson@7.4.3" \
             "Adafruit GFX Library@1.12.6" \
-            "Adafruit SSD1306@2.5.16"
+            "Adafruit SSD1306@2.5.16" \
+            "lvgl@9.3.0"
 
-      - name: Compile complete factory image
+      - name: Compile Notificator Base
         run: |
           arduino-cli compile \
             --additional-urls "$ESP32_PACKAGE_URL" \
-            --fqbn "$FQBN" \
+            --fqbn "$BASE_FQBN" \
             --output-dir build/notificator-base \
             models/notificator_base
 
+      - name: Compile Notificator Touch 3.49
+        run: |
+          arduino-cli compile \
+            --additional-urls "$ESP32_PACKAGE_URL" \
+            --fqbn "$TOUCH_FQBN" \
+            --output-dir build/notificator-touch-349 \
+            models/notificator_touch_349
+
       - name: Prepare versioned release assets
         if: github.event_name == 'release'
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          version="${RELEASE_TAG#v}"
-          cp build/notificator-base/notificator_base.ino.bin \
-            "build/notificator-base/notificator-base-${version}.ota.bin"
-          cp build/notificator-base/notificator_base.ino.merged.bin \
-            "build/notificator-base/notificator-base-${version}.factory.bin"
+          if [[ "$RELEASE_TARGET" == "notificator-base" ]]; then
+            source="build/notificator-base/notificator_base.ino"
+          else
+            source="build/notificator-touch-349/notificator_touch_349.ino"
+          fi
+          cp "${source}.bin" "build/${RELEASE_TARGET}-${RELEASE_VERSION}.ota.bin"
+          cp "${source}.merged.bin" "build/${RELEASE_TARGET}-${RELEASE_VERSION}.factory.bin"
 
       - name: Attach firmware binaries to release
         if: github.event_name == 'release'
@@ -78,10 +109,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          version="${RELEASE_TAG#v}"
           gh release upload "$RELEASE_TAG" \
-            "build/notificator-base/notificator-base-${version}.ota.bin" \
-            "build/notificator-base/notificator-base-${version}.factory.bin" \
+            "build/${RELEASE_TARGET}-${RELEASE_VERSION}.ota.bin" \
+            "build/${RELEASE_TARGET}-${RELEASE_VERSION}.factory.bin" \
             --clobber
 
       - name: Assemble web installer
@@ -89,6 +119,7 @@ jobs:
           chmod +x scripts/prepare-web-installer.sh
           scripts/prepare-web-installer.sh \
             build/notificator-base/notificator_base.ino.merged.bin \
+            build/notificator-touch-349/notificator_touch_349.ino.merged.bin \
             _site
 
       - name: Configure GitHub Pages

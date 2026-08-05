@@ -5,11 +5,22 @@
 			"id": "notificator-base-stable",
 			"name": "Notificator Base",
 			"board": "ESP32-C3 SuperMini + OLED",
-			"version": "1.2.0",
+			"version": "1.2.1",
 			"channel": "Stable",
 			"badge": "Ready to install",
 			"description": "The standard Notificator firmware for an ESP32-C3 SuperMini, a 128 × 64 SSD1306 OLED, and a TTP223 capacitive touch sensor.",
 			"manifest": "./manifests/notificator-base-stable.json",
+			"available": true
+		},
+		{
+			"id": "notificator-touch-349-preview",
+			"name": "Notificator Touch 3.49",
+			"board": "Waveshare ESP32-S3 Touch LCD 3.49",
+			"version": "0.9.1",
+			"channel": "Preview",
+			"badge": "Preview hardware",
+			"description": "The preview firmware for the Waveshare ESP32-S3 Touch LCD 3.49 with its capacitive display, audio codec, clock, weather, and alert interface.",
+			"manifest": "./manifests/notificator-touch-349-preview.json",
 			"available": true
 		}
 	]

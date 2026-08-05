@@ -1,11 +1,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <Wire.h>
+#include <lvgl.h>
 #include <math.h>
 #include <time.h>
 
@@ -20,11 +23,14 @@
 #include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "mbedtls/sha256.h"
 
 #include "src/axs15231b/esp_lcd_axs15231b.h"
 #include "src/codec_board/codec_board.h"
 #include "src/codec_board/codec_init.h"
 #include "portal_ui.h"
+#include "ota_release_config.h"
+#include "ota_security.h"
 
 /**
  * @file notificator_touch_349.ino
@@ -38,8 +44,8 @@
 
 namespace
 {
-constexpr char FIRMWARE_VERSION[] = "1.2.0";
-constexpr char FIRMWARE_LABEL[] = "1.2.0 DEV";
+constexpr char FIRMWARE_VERSION[] = "0.9.1";
+constexpr char FIRMWARE_LABEL[] = "0.9.1 PREVIEW";
 constexpr char MODEL_ID[] = "notificator_touch_349";
 constexpr char WIFI_AP_PREFIX[] = "WPNOTIF-";
 constexpr char DEFAULT_MQTT_TOPIC_PREFIX[] = "notificator-project";
@@ -49,8 +55,14 @@ constexpr unsigned long MQTT_STATUS_INTERVAL_MS = 60000;
 constexpr unsigned long MQTT_HEALTH_GRACE_MS = 5000;
 constexpr unsigned long MQTT_PULSE_INTERVAL_MS = 1000;
 constexpr unsigned long BATTERY_SAMPLE_INTERVAL_MS = 30000;
+constexpr unsigned long WEATHER_REFRESH_INTERVAL_MS = 15UL * 60UL * 1000UL;
 constexpr unsigned long IDLE_CLOCK_TIMEOUT_MS = 60000;
 constexpr unsigned long SETUP_BUTTON_HOLD_MS = 4000;
+constexpr unsigned long WIFI_WIZARD_TIMEOUT_MS = 18000;
+constexpr uint8_t MAX_WIFI_SCAN_RESULTS = 12;
+constexpr uint8_t DEFAULT_SCREEN_BRIGHTNESS = 80;
+constexpr uint8_t DEFAULT_SOUND_VOLUME = 68;
+constexpr uint8_t SETTINGS_STEP = 10;
 
 constexpr int LCD_NATIVE_WIDTH = 172;
 constexpr int LCD_NATIVE_HEIGHT = 640;
@@ -186,6 +198,7 @@ bool mqttConfigValid = false;
 bool deviceConfigured = false;
 bool networkStateChanged = false;
 bool idleClockActive = false;
+bool lvglReady = false;
 bool clockSyncStarted = false;
 bool batteryAvailable = false;
 unsigned long lastMqttAttemptMs = 0;
@@ -195,14 +208,61 @@ unsigned long lastMqttPulseRenderMs = 0;
 unsigned long lastBatterySampleMs = 0;
 unsigned long lastInteractionMs = 0;
 int lastClockMinute = -1;
+int lastClockSecond = -1;
 float batteryVoltage = 0.0F;
 uint8_t batteryPercent = 0;
+uint8_t screenBrightnessPercent = DEFAULT_SCREEN_BRIGHTNESS;
+uint8_t soundVolumePercent = DEFAULT_SOUND_VOLUME;
 int16_t clockUtcOffsetMinutes = 0;
+uint8_t idleTheme = 0;
+String weatherCity = "Athens";
+String weatherTimezone;
+float weatherLatitude = 0.0F;
+float weatherLongitude = 0.0F;
+bool weatherHasCoordinates = false;
+bool weatherHasData = false;
+bool weatherFetchInProgress = false;
+float weatherTemperatureC = 0.0F;
+float weatherWindKmh = 0.0F;
+uint8_t weatherCode = 0;
+unsigned long lastWeatherFetchMs = 0;
 
 Preferences preferences;
 WiFiManager wifiManager;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttClient(mqttTlsClient);
+
+lv_display_t *lvglDisplay = nullptr;
+lv_indev_t *lvglTouchInput = nullptr;
+lv_obj_t *lvglPageRoot = nullptr;
+lv_obj_t *lvglSetupStatus = nullptr;
+lv_obj_t *wifiPasswordInput = nullptr;
+
+enum class WifiWizardStage : uint8_t
+{
+	Idle,
+	Scanning,
+	Results,
+	Password,
+	Connecting,
+	Success,
+	Failed,
+};
+
+WifiWizardStage wifiWizardStage = WifiWizardStage::Idle;
+bool wifiWizardActive = false;
+bool pendingWifiOpen = false;
+unsigned long wifiConnectStartedMs = 0;
+uint8_t wifiScanCount = 0;
+String wifiScanSsids[MAX_WIFI_SCAN_RESULTS];
+int32_t wifiScanRssi[MAX_WIFI_SCAN_RESULTS] = {};
+bool wifiScanSecure[MAX_WIFI_SCAN_RESULTS] = {};
+String pendingWifiSsid;
+String pendingWifiPassword;
+String wifiPasswordDraft;
+String previousWifiSsid;
+String previousWifiPassword;
+uint8_t wifiKeyboardMode = 0;
 
 String setupSsid;
 String portalHeadHtml;
@@ -266,8 +326,24 @@ struct NotificationPreview
 	String title;
 	String body;
 	String source;
+	String receivedAt;
+	String severity;
 	bool available;
 	bool unread;
+};
+
+struct OtaRelease
+{
+	String channel;
+	String deviceType;
+	String board;
+	String version;
+	String url;
+	String sha256;
+	size_t size = 0;
+	String releasedAt;
+	String signature;
+	String keyId;
 };
 
 constexpr uint8_t MAX_ALERT_HISTORY = 6;
@@ -289,7 +365,7 @@ uint8_t unreadAlertCount()
 	return count;
 }
 
-void addAlert(String title, String body, String source)
+void addAlert(String title, String body, String source, String severity = "info")
 {
 	title.toUpperCase();
 	body.toUpperCase();
@@ -297,11 +373,28 @@ void addAlert(String title, String body, String source)
 	title = title.substring(0, 30);
 	body = body.substring(0, 52);
 	source = source.substring(0, 30);
+	severity.toLowerCase();
+	if (severity == "warning" || severity == "warn")
+		severity = "warning";
+	else if (severity == "critical" || severity == "error" || severity == "danger")
+		severity = "critical";
+	else
+		severity = "info";
+	String receivedAt = "JUST NOW";
+	const time_t receivedTime = time(nullptr);
+	if (receivedTime >= 1700000000)
+	{
+		tm localTime = {};
+		localtime_r(&receivedTime, &localTime);
+		char timeBuffer[6] = {};
+		strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &localTime);
+		receivedAt = timeBuffer;
+	}
 
 	const uint8_t lastIndex = min<uint8_t>(alertCount, MAX_ALERT_HISTORY - 1);
 	for (int index = lastIndex; index > 0; --index)
 		alertHistory[index] = alertHistory[index - 1];
-	alertHistory[0] = {title, body, source, true, true};
+	alertHistory[0] = {title, body, source, receivedAt, severity, true, true};
 	alertCount = min<uint8_t>(alertCount + 1, MAX_ALERT_HISTORY);
 	selectedAlertIndex = 0;
 }
@@ -335,6 +428,23 @@ void drawSetupScreen(const String &state);
 bool playTestChime();
 void startSetupPortal();
 void drawIdleClockScreen();
+bool readTouch(uint16_t &screenX, uint16_t &screenY, uint8_t &points);
+void initializeLvglUi();
+void renderLvglPage(uint8_t page);
+void renderLvglSetup(const String &state);
+void renderLvglClock();
+void handleDeviceCommand(const String &json);
+void maybeRefreshWeather();
+String weatherConditionLabel(uint8_t code);
+void performOfficialOtaUpdate(const String &requestedChannel, bool force);
+String displayPairingId();
+bool readLocalClock(tm &clockTime);
+void drawText(int x, int y, const String &text, int scale, uint16_t foreground, uint16_t background);
+void drawCenteredText(int centerX, int y, const String &text, int scale,
+	uint16_t foreground, uint16_t background);
+void applyScreenBrightness();
+void applySoundVolume();
+void saveDisplayConfiguration();
 
 uint16_t toPanelColor(uint16_t color)
 {
@@ -430,8 +540,1040 @@ void presentDisplay(uint8_t verticalScalePercent = 100)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// LVGL presentation layer
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t UI_BACKGROUND = 0x07111F;
+constexpr uint32_t UI_SURFACE = 0x111E33;
+constexpr uint32_t UI_SURFACE_RAISED = 0x192A47;
+constexpr uint32_t UI_PRIMARY = 0x2F6FED;
+constexpr uint32_t UI_PRIMARY_LIGHT = 0x72A7FF;
+constexpr uint32_t UI_TEXT = 0xF7FAFF;
+constexpr uint32_t UI_MUTED = 0x9DB0CB;
+constexpr uint32_t UI_SUCCESS = 0x20C997;
+constexpr uint32_t UI_WARNING = 0xF4B942;
+constexpr uint32_t UI_DANGER = 0xFF5C68;
+
+lv_color_t uiColor(uint32_t hex)
+{
+	return lv_color_hex(hex);
+}
+
+void lvglFlushDisplay(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
+{
+	const uint16_t *source = reinterpret_cast<const uint16_t *>(pixels);
+	const int sourceWidth = lv_area_get_width(area);
+
+	for (int nativeY = 0; nativeY < LCD_NATIVE_HEIGHT; nativeY += LCD_CHUNK_HEIGHT)
+	{
+		const int chunkHeight = min(LCD_CHUNK_HEIGHT, LCD_NATIVE_HEIGHT - nativeY);
+		for (int row = 0; row < chunkHeight; ++row)
+		{
+			const int physicalX = SCREEN_WIDTH - 1 - (nativeY + row);
+			for (int nativeX = 0; nativeX < LCD_NATIVE_WIDTH; ++nativeX)
+			{
+				const int physicalY = nativeX;
+				const int logicalX = displayFlipped ? SCREEN_WIDTH - 1 - physicalX : physicalX;
+				const int logicalY = displayFlipped ? SCREEN_HEIGHT - 1 - physicalY : physicalY;
+				uint16_t color = 0;
+				if (logicalX >= area->x1 && logicalX <= area->x2 &&
+					logicalY >= area->y1 && logicalY <= area->y2)
+				{
+					const size_t sourceIndex = static_cast<size_t>(logicalY - area->y1) * sourceWidth +
+						(logicalX - area->x1);
+					color = source[sourceIndex];
+				}
+				transferBuffer[row * LCD_NATIVE_WIDTH + nativeX] = toPanelColor(color);
+			}
+		}
+		drawNativeBitmap(0, nativeY, LCD_NATIVE_WIDTH, chunkHeight, transferBuffer);
+	}
+	lv_display_flush_ready(display);
+}
+
+void wakeFromClockAsync(void *)
+{
+	idleClockActive = false;
+	lastClockSecond = -1;
+	lastInteractionMs = millis();
+	renderLvglPage(currentPage);
+}
+
+void lvglReadTouch(lv_indev_t *, lv_indev_data_t *data)
+{
+	uint16_t x = 0;
+	uint16_t y = 0;
+	uint8_t points = 0;
+	if (readTouch(x, y, points))
+	{
+		data->state = LV_INDEV_STATE_PRESSED;
+		data->point.x = x;
+		data->point.y = y;
+		lastInteractionMs = millis();
+		if (idleClockActive)
+			lv_async_call(wakeFromClockAsync, nullptr);
+	}
+	else
+	{
+		data->state = LV_INDEV_STATE_RELEASED;
+	}
+}
+
+void styleScreen(lv_obj_t *screen, uint32_t background = UI_BACKGROUND)
+{
+	lv_obj_set_style_bg_color(screen, uiColor(background), 0);
+	lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(screen, 0, 0);
+	lv_obj_set_style_pad_all(screen, 0, 0);
+	lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int width, int height,
+	uint32_t background = UI_SURFACE, int radius = 14)
+{
+	lv_obj_t *panel = lv_obj_create(parent);
+	lv_obj_set_pos(panel, x, y);
+	lv_obj_set_size(panel, width, height);
+	lv_obj_set_style_bg_color(panel, uiColor(background), 0);
+	lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_color(panel, uiColor(0x263B5C), 0);
+	lv_obj_set_style_border_width(panel, 1, 0);
+	lv_obj_set_style_radius(panel, radius, 0);
+	lv_obj_set_style_pad_all(panel, 0, 0);
+	lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+	return panel;
+}
+
+lv_obj_t *makeLabel(lv_obj_t *parent, const String &text, const lv_font_t *font,
+	uint32_t color, int x, int y)
+{
+	lv_obj_t *label = lv_label_create(parent);
+	lv_label_set_text(label, text.c_str());
+	lv_obj_set_style_text_font(label, font, 0);
+	lv_obj_set_style_text_color(label, uiColor(color), 0);
+	lv_obj_set_pos(label, x, y);
+	return label;
+}
+
+void makeLabelFit(lv_obj_t *label, int width)
+{
+	lv_obj_set_width(label, width);
+	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+}
+
+void makeClickable(lv_obj_t *object, lv_event_cb_t callback, void *data = nullptr)
+{
+	lv_obj_add_flag(object, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_event_cb(object, callback, LV_EVENT_CLICKED, data);
+	lv_obj_set_ext_click_area(object, 4);
+}
+
+uint32_t alertSeverityColor(const String &severity)
+{
+	if (severity == "critical")
+		return UI_DANGER;
+	if (severity == "warning")
+		return UI_WARNING;
+	return UI_PRIMARY_LIGHT;
+}
+
+void uiNavigate(lv_event_t *event)
+{
+	currentPage = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+	idleClockActive = false;
+	lastInteractionMs = millis();
+	renderLvglPage(currentPage);
+}
+
+void uiOpenLatestAlert(lv_event_t *)
+{
+	if (alertCount == 0)
+		return;
+	selectedAlertIndex = 0;
+	currentPage = 1;
+	renderLvglPage(currentPage);
+}
+
+void uiAlertNewer(lv_event_t *)
+{
+	if (selectedAlertIndex > 0)
+		--selectedAlertIndex;
+	renderLvglPage(1);
+}
+
+void uiAlertOlder(lv_event_t *)
+{
+	if (selectedAlertIndex + 1 < alertCount)
+		++selectedAlertIndex;
+	renderLvglPage(1);
+}
+
+void uiMarkAlertRead(lv_event_t *)
+{
+	NotificationPreview *alert = selectedAlert();
+	if (alert != nullptr)
+		alert->unread = false;
+	renderLvglPage(1);
+}
+
+enum class DeviceSettingAction : uintptr_t
+{
+	BrightnessDown = 1,
+	BrightnessUp,
+	VolumeDown,
+	VolumeUp,
+};
+
+/** Apply one bounded hardware setting and persist it immediately. */
+void uiAdjustDeviceSetting(lv_event_t *event)
+{
+	const auto action = static_cast<DeviceSettingAction>(
+		reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+	bool previewSound = false;
+
+	switch (action)
+	{
+	case DeviceSettingAction::BrightnessDown:
+		screenBrightnessPercent = max<uint8_t>(10, screenBrightnessPercent - SETTINGS_STEP);
+		applyScreenBrightness();
+		break;
+	case DeviceSettingAction::BrightnessUp:
+		screenBrightnessPercent = min<uint8_t>(100, screenBrightnessPercent + SETTINGS_STEP);
+		applyScreenBrightness();
+		break;
+	case DeviceSettingAction::VolumeDown:
+		soundVolumePercent = soundVolumePercent <= SETTINGS_STEP
+			? 0
+			: soundVolumePercent - SETTINGS_STEP;
+		applySoundVolume();
+		previewSound = soundVolumePercent > 0;
+		break;
+	case DeviceSettingAction::VolumeUp:
+		soundVolumePercent = min<uint8_t>(100, soundVolumePercent + SETTINGS_STEP);
+		applySoundVolume();
+		previewSound = true;
+		break;
+	}
+
+	saveDisplayConfiguration();
+	lastInteractionMs = millis();
+	renderLvglPage(3);
+	if (previewSound)
+		playTestChime();
+}
+
+void beginSetupAsync(void *)
+{
+	wifiWizardActive = false;
+	wifiWizardStage = WifiWizardStage::Idle;
+	wifiPasswordInput = nullptr;
+	startSetupPortal();
+}
+
+void uiOpenSetup(lv_event_t *)
+{
+	// WiFiManager rebuilds network state and the active screen. Defer that work
+	// until LVGL has finished dispatching the current button event.
+	lv_async_call(beginSetupAsync, nullptr);
+}
+
+void renderWifiScanning();
+void renderWifiResults();
+void renderWifiPassword();
+void renderWifiConnecting();
+void renderWifiResult(bool connected);
+void animateMqttDot(lv_obj_t *dot);
+
+lv_obj_t *makeWizardButton(lv_obj_t *parent, const String &text, int x, int y,
+	int width, lv_event_cb_t callback, uint32_t background = UI_PRIMARY, void *data = nullptr)
+{
+	lv_obj_t *button = makePanel(parent, x, y, width, 30, background, 11);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_t *label = makeLabel(button, text, &lv_font_montserrat_14, UI_TEXT, 0, 0);
+	lv_obj_center(label);
+	makeClickable(button, callback, data);
+	return button;
+}
+
+void closeWifiWizardAsync(void *)
+{
+	wifiWizardActive = false;
+	wifiWizardStage = WifiWizardStage::Idle;
+	wifiPasswordInput = nullptr;
+	lastInteractionMs = millis();
+	renderLvglPage(3);
+}
+
+void uiCloseWifiWizard(lv_event_t *)
+{
+	lv_async_call(closeWifiWizardAsync, nullptr);
+}
+
+void scanWifiNetworksAsync(void *)
+{
+	const int found = WiFi.scanNetworks(false, true);
+	wifiScanCount = 0;
+	for (int index = 0; index < found && wifiScanCount < MAX_WIFI_SCAN_RESULTS; ++index)
+	{
+		const String ssid = WiFi.SSID(index);
+		if (ssid.length() == 0)
+			continue;
+		bool duplicate = false;
+		for (uint8_t saved = 0; saved < wifiScanCount; ++saved)
+		{
+			if (wifiScanSsids[saved] == ssid)
+			{
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+		wifiScanSsids[wifiScanCount] = ssid;
+		wifiScanRssi[wifiScanCount] = WiFi.RSSI(index);
+		wifiScanSecure[wifiScanCount] = WiFi.encryptionType(index) != WIFI_AUTH_OPEN;
+		++wifiScanCount;
+	}
+	WiFi.scanDelete();
+	wifiWizardStage = WifiWizardStage::Results;
+	renderWifiResults();
+}
+
+void startWifiWizardAsync(void *)
+{
+	wifiWizardActive = true;
+	wifiWizardStage = WifiWizardStage::Scanning;
+	idleClockActive = false;
+	lastInteractionMs = millis();
+	renderWifiScanning();
+	// Let LVGL paint the progress state before the synchronous radio scan.
+	lv_async_call(scanWifiNetworksAsync, nullptr);
+}
+
+void uiStartWifiWizard(lv_event_t *)
+{
+	lv_async_call(startWifiWizardAsync, nullptr);
+}
+
+void uiRescanWifi(lv_event_t *)
+{
+	lv_async_call(startWifiWizardAsync, nullptr);
+}
+
+void selectWifiNetworkAsync(void *data)
+{
+	const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(data));
+	if (index >= wifiScanCount)
+		return;
+	pendingWifiSsid = wifiScanSsids[index];
+	pendingWifiPassword = "";
+	wifiPasswordDraft = "";
+	wifiKeyboardMode = 0;
+	pendingWifiOpen = !wifiScanSecure[index];
+	wifiWizardStage = WifiWizardStage::Password;
+	renderWifiPassword();
+}
+
+void uiSelectWifiNetwork(lv_event_t *event)
+{
+	lv_async_call(selectWifiNetworkAsync, lv_event_get_user_data(event));
+}
+
+void restorePreviousWifi()
+{
+	WiFi.disconnect(false, false);
+	if (previousWifiSsid.length() > 0)
+	{
+		WiFi.begin(previousWifiSsid.c_str(), previousWifiPassword.c_str());
+		Serial.printf("[WIFI] Restoring previous network: %s\n", previousWifiSsid.c_str());
+	}
+}
+
+void beginWifiConnectionAsync(void *)
+{
+	if (pendingWifiSsid.length() == 0)
+		return;
+	if (!pendingWifiOpen)
+		pendingWifiPassword = wifiPasswordDraft;
+
+	// Snapshot the working station before WiFi.begin() replaces the persisted
+	// credentials. On failure, restore this exact pair automatically.
+	previousWifiSsid = WiFi.SSID();
+	previousWifiPassword = WiFi.psk();
+	wifiPasswordInput = nullptr;
+	wifiWizardStage = WifiWizardStage::Connecting;
+	renderWifiConnecting();
+	mqttClient.disconnect();
+	WiFi.disconnect(false, false);
+	WiFi.mode(WIFI_STA);
+	WiFi.begin(pendingWifiSsid.c_str(), pendingWifiOpen ? nullptr : pendingWifiPassword.c_str());
+	wifiConnectStartedMs = millis();
+	Serial.printf("[WIFI] Testing selected network: %s\n", pendingWifiSsid.c_str());
+}
+
+void uiConnectSelectedWifi(lv_event_t *)
+{
+	lv_async_call(beginWifiConnectionAsync, nullptr);
+}
+
+void retryWifiPasswordAsync(void *)
+{
+	wifiWizardStage = WifiWizardStage::Password;
+	renderWifiPassword();
+}
+
+void uiRetryWifiPassword(lv_event_t *)
+{
+	lv_async_call(retryWifiPasswordAsync, nullptr);
+}
+
+void refreshWifiPasswordAsync(void *)
+{
+	renderWifiPassword();
+}
+
+void uiWifiKeyboardKey(lv_event_t *event)
+{
+	const char *key = static_cast<const char *>(lv_event_get_user_data(event));
+	if (key == nullptr)
+		return;
+	if (strcmp(key, "BKSP") == 0)
+	{
+		if (wifiPasswordDraft.length() > 0)
+			wifiPasswordDraft.remove(wifiPasswordDraft.length() - 1);
+	}
+	else if (strcmp(key, "SHIFT") == 0)
+	{
+		wifiKeyboardMode = wifiKeyboardMode == 1 ? 0 : 1;
+		lv_async_call(refreshWifiPasswordAsync, nullptr);
+		return;
+	}
+	else if (strcmp(key, "SYM") == 0 || strcmp(key, "ABC") == 0)
+	{
+		wifiKeyboardMode = strcmp(key, "SYM") == 0 ? 2 : 0;
+		lv_async_call(refreshWifiPasswordAsync, nullptr);
+		return;
+	}
+	else if (strcmp(key, "SPACE") == 0)
+	{
+		if (wifiPasswordDraft.length() < 63)
+			wifiPasswordDraft += ' ';
+	}
+	else if (wifiPasswordDraft.length() < 63)
+	{
+		wifiPasswordDraft += key;
+	}
+	if (wifiPasswordInput != nullptr)
+	{
+		lv_textarea_set_text(wifiPasswordInput, wifiPasswordDraft.c_str());
+		lv_textarea_set_cursor_pos(wifiPasswordInput, LV_TEXTAREA_CURSOR_LAST);
+	}
+}
+
+void buildWifiKeyboard(lv_obj_t *parent)
+{
+	static const char *lower0[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
+	static const char *lower1[] = {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"};
+	static const char *lower2[] = {"a", "s", "d", "f", "g", "h", "j", "k", "l", "BKSP"};
+	static const char *lower3[] = {"SHIFT", "SYM", "z", "x", "c", "v", "b", "n", "m", "-", "_", "."};
+	static const char *upper1[] = {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"};
+	static const char *upper2[] = {"A", "S", "D", "F", "G", "H", "J", "K", "L", "BKSP"};
+	static const char *upper3[] = {"SHIFT", "SYM", "Z", "X", "C", "V", "B", "N", "M", "-", "_", "."};
+	static const char *symbol0[] = {"!", "@", "#", "$", "%", "^", "&", "*", "(", ")"};
+	static const char *symbol1[] = {"~", "`", "+", "=", "{", "}", "[", "]", "|", "\\"};
+	static const char *symbol2[] = {":", ";", "\"", "'", "<", ">", "?", ",", "/", "BKSP"};
+	static const char *symbol3[] = {"ABC", "SPACE", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
+
+	const char **rows[4] = {};
+	uint8_t counts[] = {10, 10, 10, 12};
+	if (wifiKeyboardMode == 2)
+	{
+		rows[0] = symbol0;
+		rows[1] = symbol1;
+		rows[2] = symbol2;
+		rows[3] = symbol3;
+	}
+	else
+	{
+		rows[0] = lower0;
+		rows[1] = wifiKeyboardMode == 1 ? upper1 : lower1;
+		rows[2] = wifiKeyboardMode == 1 ? upper2 : lower2;
+		rows[3] = wifiKeyboardMode == 1 ? upper3 : lower3;
+	}
+
+	constexpr int keyboardX = 2;
+	constexpr int keyboardWidth = 636;
+	constexpr int keyGap = 2;
+	constexpr int keyHeight = 17;
+	for (uint8_t row = 0; row < 4; ++row)
+	{
+		const int keyWidth = (keyboardWidth - keyGap * (counts[row] - 1)) / counts[row];
+		for (uint8_t column = 0; column < counts[row]; ++column)
+		{
+			const char *key = rows[row][column];
+			const bool action = strcmp(key, "BKSP") == 0 || strcmp(key, "SHIFT") == 0 ||
+				strcmp(key, "SYM") == 0 || strcmp(key, "ABC") == 0 || strcmp(key, "SPACE") == 0;
+			lv_obj_t *button = makePanel(parent,
+				keyboardX + column * (keyWidth + keyGap), 94 + row * 19,
+				keyWidth, keyHeight, action ? UI_PRIMARY : UI_SURFACE_RAISED, 4);
+			lv_obj_set_style_border_width(button, 0, 0);
+			String labelText = key;
+			if (strcmp(key, "BKSP") == 0)
+				labelText = "DEL";
+			else if (strcmp(key, "SHIFT") == 0)
+				labelText = wifiKeyboardMode == 1 ? "abc" : "ABC";
+			lv_obj_t *label = makeLabel(button, labelText, &lv_font_montserrat_14,
+				UI_TEXT, 0, 0);
+			lv_obj_center(label);
+			makeClickable(button, uiWifiKeyboardKey, const_cast<char *>(key));
+		}
+	}
+}
+
+void renderWifiShell(const String &title, const String &subtitle)
+{
+	lv_obj_t *screen = lv_screen_active();
+	lv_obj_clean(screen);
+	styleScreen(screen);
+	makeLabel(screen, title, &lv_font_montserrat_20, UI_TEXT, 16, 9);
+	makeLabel(screen, subtitle, &lv_font_montserrat_14, UI_MUTED, 16, 34);
+}
+
+void renderWifiScanning()
+{
+	renderWifiShell("Choose a Wi-Fi network", "Looking for nearby networks...");
+	lv_obj_t *panel = makePanel(lv_screen_active(), 16, 64, 608, 82, UI_SURFACE, 16);
+	lv_obj_t *dot = makePanel(panel, 20, 31, 16, 16, UI_PRIMARY, 8);
+	lv_obj_set_style_border_width(dot, 0, 0);
+	animateMqttDot(dot);
+	makeLabel(panel, "Scanning", &lv_font_montserrat_20, UI_TEXT, 52, 17);
+	makeLabel(panel, "This normally takes a few seconds.", &lv_font_montserrat_14, UI_MUTED, 52, 46);
+	lv_obj_invalidate(lv_screen_active());
+	lv_refr_now(lvglDisplay);
+}
+
+void renderWifiResults()
+{
+	renderWifiShell("Choose a Wi-Fi network", String(wifiScanCount) + " networks available");
+	makeWizardButton(lv_screen_active(), "Back", 474, 8, 68, uiCloseWifiWizard, UI_SURFACE_RAISED);
+	makeWizardButton(lv_screen_active(), "Rescan", 550, 8, 74, uiRescanWifi);
+
+	if (wifiScanCount == 0)
+	{
+		makeLabel(lv_screen_active(), "No networks found. Move closer to the access point or rescan.",
+			&lv_font_montserrat_16, UI_MUTED, 16, 82);
+		return;
+	}
+	lv_obj_t *list = makePanel(lv_screen_active(), 10, 58, 620, 104, UI_SURFACE, 14);
+	lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scroll_dir(list, LV_DIR_VER);
+	lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+	lv_obj_set_style_pad_all(list, 6, 0);
+	for (uint8_t index = 0; index < wifiScanCount; ++index)
+	{
+		lv_obj_t *row = makePanel(list, 6, index * 38 + 5, 594, 34,
+			index == 0 ? 0x162B4B : UI_SURFACE_RAISED, 10);
+		lv_obj_t *ssid = makeLabel(row, wifiScanSsids[index], &lv_font_montserrat_16,
+			UI_TEXT, 12, 6);
+		makeLabelFit(ssid, 390);
+		String signal = String(wifiScanRssi[index]) + " dBm  " +
+			(wifiScanSecure[index] ? "Secured" : "Open");
+		makeLabel(row, signal, &lv_font_montserrat_14,
+			wifiScanSecure[index] ? UI_MUTED : UI_WARNING, 418, 7);
+		makeClickable(row, uiSelectWifiNetwork,
+			reinterpret_cast<void *>(static_cast<uintptr_t>(index)));
+	}
+	lv_obj_invalidate(lv_screen_active());
+	lv_refr_now(lvglDisplay);
+}
+
+void renderWifiPassword()
+{
+	renderWifiShell("Connect to " + pendingWifiSsid,
+		pendingWifiOpen ? "This network does not require a password." : "Enter the network password");
+	makeWizardButton(lv_screen_active(), "Back", 474, 8, 68, uiRescanWifi, UI_SURFACE_RAISED);
+	makeWizardButton(lv_screen_active(), "Connect", 550, 8, 74, uiConnectSelectedWifi);
+	if (pendingWifiOpen)
+	{
+		lv_obj_t *panel = makePanel(lv_screen_active(), 16, 68, 608, 78, UI_SURFACE, 16);
+		makeLabel(panel, "Open network", &lv_font_montserrat_20, UI_WARNING, 18, 14);
+		makeLabel(panel, "Traffic on open Wi-Fi may not be private. MQTT remains protected by TLS.",
+			&lv_font_montserrat_14, UI_MUTED, 18, 45);
+		return;
+	}
+
+	wifiPasswordInput = lv_textarea_create(lv_screen_active());
+	lv_obj_set_pos(wifiPasswordInput, 0, 54);
+	lv_obj_set_size(wifiPasswordInput, 640, 38);
+	lv_textarea_set_one_line(wifiPasswordInput, true);
+	// The compact physical display makes mistaps more likely. Keep the entered
+	// value visible so users can verify it before replacing saved credentials.
+	lv_textarea_set_password_mode(wifiPasswordInput, false);
+	lv_textarea_set_max_length(wifiPasswordInput, 63);
+	lv_textarea_set_placeholder_text(wifiPasswordInput, "Wi-Fi password");
+	lv_textarea_set_text(wifiPasswordInput, wifiPasswordDraft.c_str());
+	lv_obj_set_style_text_font(wifiPasswordInput, &lv_font_montserrat_16, 0);
+	lv_obj_set_style_text_color(wifiPasswordInput, uiColor(UI_TEXT), 0);
+	lv_obj_set_style_bg_color(wifiPasswordInput, uiColor(UI_SURFACE), 0);
+	lv_obj_set_style_bg_opa(wifiPasswordInput, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_color(wifiPasswordInput, uiColor(UI_PRIMARY), 0);
+	lv_obj_set_style_border_width(wifiPasswordInput, 2, 0);
+	lv_obj_set_style_radius(wifiPasswordInput, 10, 0);
+	lv_obj_set_style_pad_left(wifiPasswordInput, 12, 0);
+	lv_obj_set_style_pad_top(wifiPasswordInput, 6, 0);
+
+	buildWifiKeyboard(lv_screen_active());
+	lv_obj_invalidate(lv_screen_active());
+	lv_refr_now(lvglDisplay);
+}
+
+void renderWifiConnecting()
+{
+	renderWifiShell("Testing " + pendingWifiSsid, "Your saved network is kept until this succeeds.");
+	lv_obj_t *panel = makePanel(lv_screen_active(), 16, 64, 608, 82, UI_SURFACE, 16);
+	lv_obj_t *dot = makePanel(panel, 20, 31, 16, 16, UI_PRIMARY, 8);
+	lv_obj_set_style_border_width(dot, 0, 0);
+	animateMqttDot(dot);
+	makeLabel(panel, "Connecting securely", &lv_font_montserrat_20, UI_TEXT, 52, 17);
+	makeLabel(panel, "The previous network will be restored if this fails.",
+		&lv_font_montserrat_14, UI_MUTED, 52, 46);
+	lv_obj_invalidate(lv_screen_active());
+	lv_refr_now(lvglDisplay);
+}
+
+void renderWifiResult(bool connected)
+{
+	renderWifiShell(connected ? "Wi-Fi connected" : "Could not connect",
+		connected ? pendingWifiSsid : "The previous network is being restored.");
+	lv_obj_t *panel = makePanel(lv_screen_active(), 16, 64, 608, 82,
+		connected ? 0x113A37 : 0x3A202B, 16);
+	makeLabel(panel, connected ? "Connection saved" : "Check the password and try again",
+		&lv_font_montserrat_20, connected ? UI_SUCCESS : UI_DANGER, 18, 14);
+	makeLabel(panel,
+		connected ? "The device will reconnect to MQTT automatically."
+			: "You can retry here or use the phone setup portal.",
+		&lv_font_montserrat_14, UI_MUTED, 18, 45);
+	if (connected)
+		makeWizardButton(panel, "Done", 494, 26, 96, uiCloseWifiWizard);
+	else
+	{
+		makeWizardButton(panel, "Retry", 390, 26, 90, uiRetryWifiPassword);
+		makeWizardButton(panel, "Phone setup", 488, 26, 104, uiOpenSetup, UI_SURFACE_RAISED);
+	}
+	lv_obj_invalidate(lv_screen_active());
+	lv_refr_now(lvglDisplay);
+}
+
+void animateMqttDot(lv_obj_t *dot)
+{
+	lv_anim_t animation;
+	lv_anim_init(&animation);
+	lv_anim_set_var(&animation, dot);
+	lv_anim_set_values(&animation, LV_OPA_70, LV_OPA_COVER);
+	lv_anim_set_duration(&animation, 850);
+	lv_anim_set_playback_duration(&animation, 850);
+	lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+	lv_anim_set_exec_cb(&animation, [](void *object, int32_t opacity)
+		{
+			lv_obj_set_style_opa(static_cast<lv_obj_t *>(object), static_cast<lv_opa_t>(opacity), 0);
+		});
+	lv_anim_start(&animation);
+}
+
+void buildHeader(lv_obj_t *root, const String &section)
+{
+	makeLabel(root, "Notificator", &lv_font_montserrat_20, UI_TEXT, 14, 7);
+	makeLabel(root, section, &lv_font_montserrat_14, UI_PRIMARY_LIGHT, 143, 11);
+
+	const bool wifiReady = WiFi.isConnected();
+	const bool mqttHealthy = mqttClient.connected() && millis() - lastMqttHealthMs <= MQTT_HEALTH_GRACE_MS;
+	lv_obj_t *wifiPill = makePanel(root, 338, 6, 84, 28, UI_SURFACE, 12);
+	lv_obj_set_style_border_width(wifiPill, 0, 0);
+	lv_obj_t *wifiDot = makePanel(wifiPill, 10, 10, 8, 8, wifiReady ? UI_SUCCESS : UI_DANGER, 4);
+	lv_obj_set_style_border_width(wifiDot, 0, 0);
+	makeLabel(wifiPill, wifiReady ? "Wi-Fi" : "Offline", &lv_font_montserrat_14,
+		wifiReady ? UI_MUTED : UI_DANGER, 25, 5);
+
+	lv_obj_t *mqttPill = makePanel(root, 428, 6, 84, 28, UI_SURFACE, 12);
+	lv_obj_set_style_border_width(mqttPill, 0, 0);
+	lv_obj_t *mqttDot = makePanel(mqttPill, 10, 10, 8, 8, mqttHealthy ? UI_SUCCESS : UI_DANGER, 4);
+	lv_obj_set_style_border_width(mqttDot, 0, 0);
+	makeLabel(mqttPill, mqttHealthy ? "MQTT" : "Lost", &lv_font_montserrat_14,
+		mqttHealthy ? UI_MUTED : UI_DANGER, 25, 5);
+	if (mqttHealthy)
+		animateMqttDot(mqttDot);
+
+	String power = batteryAvailable ? String(batteryPercent) + "%" : "USB";
+	lv_obj_t *batteryPill = makePanel(root, 518, 6, 112, 28, UI_SURFACE, 12);
+	lv_obj_set_style_border_width(batteryPill, 0, 0);
+	makeLabel(batteryPill, "BAT", &lv_font_montserrat_14, UI_MUTED, 10, 5);
+	makeLabel(batteryPill, power, &lv_font_montserrat_14,
+		batteryAvailable && batteryPercent <= 15 ? UI_DANGER : UI_TEXT, 52, 5);
+}
+
+void buildNavigation(lv_obj_t *root, uint8_t active)
+{
+	lv_obj_t *bar = makePanel(root, 8, 138, 624, 30, UI_SURFACE, 12);
+	lv_obj_set_style_border_width(bar, 0, 0);
+	const char *labels[] = {"Home", "Alerts", "Device", "Settings"};
+	for (uint8_t index = 0; index < 4; ++index)
+	{
+		lv_obj_t *button = makePanel(bar, index * 153 + 3, 3, 149, 24,
+			index == active ? UI_PRIMARY : UI_SURFACE, 10);
+		lv_obj_set_style_border_width(button, 0, 0);
+		lv_obj_t *label = makeLabel(button, labels[index], &lv_font_montserrat_14,
+			index == active ? UI_TEXT : UI_MUTED, 0, 1);
+		lv_obj_center(label);
+		makeClickable(button, uiNavigate, reinterpret_cast<void *>(static_cast<uintptr_t>(index)));
+		if (index == 1 && unreadAlertCount() > 0)
+		{
+			lv_obj_t *badge = makePanel(button, 112, 3, 20, 18, UI_DANGER, 9);
+			lv_obj_set_style_border_width(badge, 0, 0);
+			lv_obj_t *count = makeLabel(badge, String(unreadAlertCount()), &lv_font_montserrat_14,
+				UI_TEXT, 0, 0);
+			lv_obj_center(count);
+		}
+	}
+}
+
+void buildHome(lv_obj_t *root)
+{
+	NotificationPreview *latest = alertCount > 0 ? &alertHistory[0] : nullptr;
+	// A solid color avoids visible RGB565 gradient bands on this narrow panel.
+	lv_obj_t *alertCard = makePanel(root, 10, 40, 416, 94, 0x122D56, 16);
+	if (latest != nullptr)
+	{
+		const uint32_t severityColor = alertSeverityColor(latest->severity);
+		lv_obj_t *accent = makePanel(alertCard, 0, 0, 6, 94, severityColor, 3);
+		lv_obj_set_style_border_width(accent, 0, 0);
+		String status = latest->severity;
+		status.toUpperCase();
+		status += latest->unread ? "  •  UNREAD" : "  •  READ";
+		makeLabel(alertCard, status, &lv_font_montserrat_14, severityColor, 16, 8);
+		makeLabel(alertCard, latest->receivedAt, &lv_font_montserrat_14, UI_MUTED, 344, 8);
+		lv_obj_t *title = makeLabel(alertCard, latest->title, &lv_font_montserrat_20, UI_TEXT, 16, 31);
+		makeLabelFit(title, 382);
+		lv_obj_t *body = makeLabel(alertCard, latest->body, &lv_font_montserrat_14, UI_MUTED, 16, 60);
+		makeLabelFit(body, 382);
+		makeClickable(alertCard, uiOpenLatestAlert);
+	}
+	else
+	{
+		makeLabel(alertCard, "SYSTEM READY", &lv_font_montserrat_14, UI_SUCCESS, 16, 9);
+		makeLabel(alertCard, "All caught up", &lv_font_montserrat_24, UI_TEXT, 16, 32);
+		makeLabel(alertCard, "Your next site event will appear here.", &lv_font_montserrat_14,
+			UI_MUTED, 16, 65);
+	}
+
+	lv_obj_t *unreadCard = makePanel(root, 436, 40, 194, 44, UI_SURFACE, 13);
+	makeLabel(unreadCard, "UNREAD", &lv_font_montserrat_14, UI_MUTED, 14, 13);
+	makeLabel(unreadCard, String(unreadAlertCount()), &lv_font_montserrat_28,
+		unreadAlertCount() > 0 ? UI_PRIMARY_LIGHT : UI_TEXT, 146, 5);
+	makeClickable(unreadCard, uiOpenLatestAlert);
+
+	const bool mqttHealthy = mqttClient.connected() && millis() - lastMqttHealthMs <= MQTT_HEALTH_GRACE_MS;
+	lv_obj_t *mqttCard = makePanel(root, 436, 90, 194, 44,
+		mqttHealthy ? UI_SURFACE : UI_PRIMARY, 13);
+	lv_obj_t *dot = makePanel(mqttCard, 14, 17, 10, 10,
+		mqttHealthy ? UI_SUCCESS : UI_DANGER, 5);
+	lv_obj_set_style_border_width(dot, 0, 0);
+	makeLabel(mqttCard, mqttHealthy ? "MQTT live" : "Connect MQTT",
+		&lv_font_montserrat_16, UI_TEXT, 34, 11);
+	if (mqttHealthy)
+		animateMqttDot(dot);
+	else
+		makeClickable(mqttCard, uiOpenSetup);
+}
+
+void buildAlerts(lv_obj_t *root)
+{
+	NotificationPreview *alert = selectedAlert();
+	lv_obj_t *card = makePanel(root, 10, 40, 620, 94, UI_SURFACE_RAISED, 16);
+	if (alert == nullptr)
+	{
+		makeLabel(card, "NO ALERTS", &lv_font_montserrat_14, UI_SUCCESS, 18, 10);
+		makeLabel(card, "Nothing needs your attention", &lv_font_montserrat_20, UI_TEXT, 18, 34);
+		makeLabel(card, "New events will be kept here while the device is powered.",
+			&lv_font_montserrat_14, UI_MUTED, 18, 63);
+		return;
+	}
+
+	const uint32_t severityColor = alertSeverityColor(alert->severity);
+	lv_obj_t *accent = makePanel(card, 0, 0, 6, 94, severityColor, 3);
+	lv_obj_set_style_border_width(accent, 0, 0);
+	String status = alert->severity;
+	status.toUpperCase();
+	status += alert->unread ? "  •  UNREAD" : "  •  READ";
+	makeLabel(card, status, &lv_font_montserrat_14, severityColor, 18, 7);
+	makeLabel(card, String(selectedAlertIndex + 1) + " / " + String(alertCount),
+		&lv_font_montserrat_14, UI_MUTED, 350, 7);
+	lv_obj_t *title = makeLabel(card, alert->title, &lv_font_montserrat_20, UI_TEXT, 18, 28);
+	makeLabelFit(title, 390);
+	lv_obj_t *body = makeLabel(card, alert->body, &lv_font_montserrat_14, UI_MUTED, 18, 58);
+	makeLabelFit(body, 390);
+	makeClickable(card, uiMarkAlertRead);
+
+	lv_obj_t *newer = makePanel(card, 430, 12, 78, 30,
+		selectedAlertIndex > 0 ? UI_PRIMARY : UI_SURFACE, 10);
+	lv_obj_t *newerLabel = makeLabel(newer, "Newer", &lv_font_montserrat_14,
+		selectedAlertIndex > 0 ? UI_TEXT : UI_MUTED, 0, 0);
+	lv_obj_center(newerLabel);
+	makeClickable(newer, uiAlertNewer);
+	lv_obj_t *older = makePanel(card, 516, 12, 86, 30,
+		selectedAlertIndex + 1 < alertCount ? UI_PRIMARY : UI_SURFACE, 10);
+	lv_obj_t *olderLabel = makeLabel(older, "Older", &lv_font_montserrat_14,
+		selectedAlertIndex + 1 < alertCount ? UI_TEXT : UI_MUTED, 0, 0);
+	lv_obj_center(olderLabel);
+	makeClickable(older, uiAlertOlder);
+	makeLabel(card, alert->source, &lv_font_montserrat_14, UI_PRIMARY_LIGHT, 430, 58);
+	makeLabel(card, alert->receivedAt, &lv_font_montserrat_14, UI_MUTED, 550, 58);
+}
+
+void buildDevice(lv_obj_t *root)
+{
+	const String batteryText = batteryAvailable
+		? String(batteryPercent) + "%  " + String(batteryVoltage, 2) + "V"
+		: "USB power";
+	const String values[] = {displayPairingId(), FIRMWARE_LABEL, batteryText,
+		mqttClient.connected() ? "Connected" : "Disconnected"};
+	const String labels[] = {"DEVICE ID", "FIRMWARE", "BATTERY", "MQTT"};
+	for (uint8_t index = 0; index < 4; ++index)
+	{
+		lv_obj_t *card = makePanel(root, 10 + index * 155, 40, 145, 94, UI_SURFACE, 14);
+		makeLabel(card, labels[index], &lv_font_montserrat_14, UI_MUTED, 12, 12);
+		lv_obj_t *value = makeLabel(card, values[index], &lv_font_montserrat_18,
+			index == 3 ? (mqttClient.connected() ? UI_SUCCESS : UI_DANGER) : UI_TEXT, 12, 42);
+		makeLabelFit(value, 121);
+	}
+}
+
+void buildSettings(lv_obj_t *root)
+{
+	const bool wifiReady = WiFi.isConnected();
+	String networkName = wifiReady ? WiFi.SSID() : "Not connected";
+	if (networkName.length() == 0)
+		networkName = "Saved network";
+
+	lv_obj_t *networkCard = makePanel(root, 10, 40, 235, 94, UI_SURFACE, 15);
+	makeLabel(networkCard, "WI-FI NETWORK", &lv_font_montserrat_14, UI_MUTED, 16, 10);
+	lv_obj_t *network = makeLabel(networkCard, networkName, &lv_font_montserrat_20,
+		wifiReady ? UI_TEXT : UI_DANGER, 16, 35);
+	makeLabelFit(network, 203);
+	lv_obj_t *dot = makePanel(networkCard, 16, 68, 9, 9,
+		wifiReady ? UI_SUCCESS : UI_DANGER, 5);
+	lv_obj_set_style_border_width(dot, 0, 0);
+	makeLabel(networkCard, wifiReady ? "Connected" : "Offline", &lv_font_montserrat_14,
+		wifiReady ? UI_SUCCESS : UI_DANGER, 33, 65);
+
+	lv_obj_t *actionCard = makePanel(root, 255, 40, 190, 94, 0x122D56, 15);
+	makeLabel(actionCard, "Change Wi-Fi network", &lv_font_montserrat_20, UI_TEXT, 16, 10);
+	makeLabel(actionCard, "Connect on this screen.",
+		&lv_font_montserrat_14, UI_MUTED, 16, 38);
+	lv_obj_t *button = makePanel(actionCard, 16, 59, 158, 28, UI_PRIMARY, 11);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_t *buttonLabel = makeLabel(button, "Choose network", &lv_font_montserrat_14, UI_TEXT, 0, 0);
+	lv_obj_center(buttonLabel);
+	makeClickable(button, uiStartWifiWizard);
+
+	lv_obj_t *controlsCard = makePanel(root, 455, 40, 175, 94, UI_SURFACE, 15);
+	const char *labels[] = {"DISPLAY", "VOLUME"};
+	const uint8_t values[] = {screenBrightnessPercent, soundVolumePercent};
+	const DeviceSettingAction downActions[] = {
+		DeviceSettingAction::BrightnessDown, DeviceSettingAction::VolumeDown};
+	const DeviceSettingAction upActions[] = {
+		DeviceSettingAction::BrightnessUp, DeviceSettingAction::VolumeUp};
+	for (uint8_t index = 0; index < 2; ++index)
+	{
+		const int y = 8 + index * 42;
+		makeLabel(controlsCard, labels[index], &lv_font_montserrat_14, UI_MUTED, 10, y + 5);
+		makeLabel(controlsCard, String(values[index]) + "%", &lv_font_montserrat_14,
+			UI_TEXT, 69, y + 5);
+		lv_obj_t *minus = makePanel(controlsCard, 111, y, 24, 26, UI_SURFACE_RAISED, 8);
+		lv_obj_t *minusLabel = makeLabel(minus, "-", &lv_font_montserrat_20, UI_TEXT, 0, 0);
+		lv_obj_center(minusLabel);
+		makeClickable(minus, uiAdjustDeviceSetting,
+			reinterpret_cast<void *>(static_cast<uintptr_t>(downActions[index])));
+		lv_obj_t *plus = makePanel(controlsCard, 141, y, 24, 26, UI_PRIMARY, 8);
+		lv_obj_t *plusLabel = makeLabel(plus, "+", &lv_font_montserrat_20, UI_TEXT, 0, 0);
+		lv_obj_center(plusLabel);
+		makeClickable(plus, uiAdjustDeviceSetting,
+			reinterpret_cast<void *>(static_cast<uintptr_t>(upActions[index])));
+	}
+}
+
+void renderLvglPage(uint8_t page)
+{
+	if (!lvglReady)
+		return;
+	lv_obj_t *screen = lv_screen_active();
+	lv_obj_clean(screen);
+	styleScreen(screen);
+	lvglPageRoot = screen;
+	const String section = page == 0 ? "Home" : page == 1 ? "Alerts" : page == 2 ? "Device" : "Settings";
+	buildHeader(screen, section);
+	if (page == 0)
+		buildHome(screen);
+	else if (page == 1)
+		buildAlerts(screen);
+	else if (page == 2)
+		buildDevice(screen);
+	else
+		buildSettings(screen);
+	buildNavigation(screen, page);
+	lv_obj_invalidate(screen);
+	lv_refr_now(lvglDisplay);
+}
+
+void renderLvglClock()
+{
+	if (!lvglReady)
+		return;
+	// Keep LVGL responsible for the full-screen wake target, then draw the clock
+	// directly into the RGB565 framebuffer. Native integer-scaled bitmap glyphs
+	// remain razor sharp, unlike a transformed vector font on this 172 px panel.
+	if (lastClockSecond < 0)
+	{
+		lv_obj_t *screen = lv_screen_active();
+		lv_obj_clean(screen);
+		styleScreen(screen, 0x000000);
+		lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_add_event_cb(screen, [](lv_event_t *) { lv_async_call(wakeFromClockAsync, nullptr); },
+			LV_EVENT_CLICKED, nullptr);
+		lv_obj_invalidate(screen);
+		lv_refr_now(lvglDisplay);
+	}
+
+	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BLACK);
+	tm clockTime = {};
+	String timeText = "--:--";
+	String dateText = WiFi.isConnected() ? "Syncing time" : "Connect Wi-Fi for time";
+	if (readLocalClock(clockTime))
+	{
+		char timeBuffer[6] = {};
+		char dateBuffer[28] = {};
+		strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &clockTime);
+		strftime(dateBuffer, sizeof(dateBuffer), "%A, %d %B", &clockTime);
+		timeText = timeBuffer;
+		dateText = dateBuffer;
+		lastClockMinute = clockTime.tm_min;
+		lastClockSecond = clockTime.tm_sec;
+	}
+	else
+	{
+		lastClockMinute = -1;
+		lastClockSecond = static_cast<int>((millis() / 1000) % 60);
+	}
+	// Alternate the separator without scaling or animating the digit glyphs.
+	// This mirrors a traditional digital clock and preserves the crisp bitmap.
+	if ((lastClockSecond & 1) != 0 && timeText.length() >= 3)
+		timeText.setCharAt(2, ' ');
+	dateText.toUpperCase();
+	String cityText = weatherCity.length() ? weatherCity : "WEATHER";
+	cityText.toUpperCase();
+	cityText = cityText.substring(0, 18);
+	const String temperatureText = weatherHasData
+		? String(static_cast<int>(roundf(weatherTemperatureC))) + "C"
+		: "--C";
+	const String conditionText = weatherHasData
+		? weatherConditionLabel(weatherCode)
+		: (WiFi.isConnected() ? "UPDATING" : "OFFLINE");
+
+	if (idleTheme == 1)
+	{
+		drawCenteredText(190, 35, timeText, 9, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(190, 125, dateText, 2, COLOR_MUTED, COLOR_BLACK);
+		fillRectangle(386, 22, 2, 128, COLOR_PANEL_RAISED);
+		drawCenteredText(510, 23, cityText, 2, COLOR_BLUE_LIGHT, COLOR_BLACK);
+		drawCenteredText(510, 55, temperatureText, 8,
+			weatherHasData ? COLOR_WHITE : COLOR_MUTED, COLOR_BLACK);
+		drawCenteredText(510, 132, conditionText, 2, COLOR_MUTED, COLOR_BLACK);
+	}
+	else if (idleTheme == 2)
+	{
+		drawCenteredText(SCREEN_WIDTH / 2, 18, cityText, 3, COLOR_BLUE_LIGHT, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 53, temperatureText, 9,
+			weatherHasData ? COLOR_WHITE : COLOR_MUTED, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 139, conditionText, 2, COLOR_MUTED, COLOR_BLACK);
+	}
+	else
+	{
+		drawCenteredText(SCREEN_WIDTH / 2, 24, timeText, 13, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 140, dateText, 2, COLOR_MUTED, COLOR_BLACK);
+	}
+	presentDisplay();
+}
+
+void renderLvglSetup(const String &state)
+{
+	if (!lvglReady)
+		return;
+	lv_obj_t *screen = lv_screen_active();
+	lv_obj_clean(screen);
+	styleScreen(screen);
+	lv_obj_t *identity = makePanel(screen, 10, 10, 210, 152, UI_PRIMARY, 18);
+	lv_obj_set_style_border_width(identity, 0, 0);
+	makeLabel(identity, "Notificator", &lv_font_montserrat_20, UI_TEXT, 18, 18);
+	makeLabel(identity, "PAIRING ID", &lv_font_montserrat_14, 0xDCE8FF, 18, 62);
+	makeLabel(identity, displayPairingId(), &lv_font_montserrat_24, UI_TEXT, 18, 84);
+	makeLabel(identity, "Use this ID in the app", &lv_font_montserrat_14, 0xDCE8FF, 18, 120);
+
+	makeLabel(screen, "Connect your display", &lv_font_montserrat_24, UI_TEXT, 246, 16);
+	makeLabel(screen, "1", &lv_font_montserrat_20, UI_PRIMARY_LIGHT, 246, 55);
+	makeLabel(screen, "Join " + setupSsid, &lv_font_montserrat_16, UI_TEXT, 276, 57);
+	makeLabel(screen, "2", &lv_font_montserrat_20, UI_PRIMARY_LIGHT, 246, 88);
+	makeLabel(screen, "Open 192.168.4.1 and add Wi-Fi + HiveMQ",
+		&lv_font_montserrat_14, UI_MUTED, 276, 92);
+	lvglSetupStatus = makeLabel(screen, state, &lv_font_montserrat_14, UI_SUCCESS, 246, 132);
+	lv_obj_invalidate(screen);
+	lv_refr_now(lvglDisplay);
+}
+
+void renderLvglSplash()
+{
+	lv_obj_t *screen = lv_screen_active();
+	lv_obj_clean(screen);
+	styleScreen(screen, UI_PRIMARY);
+	lv_obj_t *title = makeLabel(screen, "Notificator", &lv_font_montserrat_32, UI_TEXT, 0, 45);
+	lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+	lv_obj_set_y(title, 45);
+	lv_obj_t *subtitle = makeLabel(screen, "Touch", &lv_font_montserrat_20, 0xDCE8FF, 0, 88);
+	lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 88);
+	makeLabel(screen, "Starting securely…", &lv_font_montserrat_14, 0xDCE8FF, 500, 144);
+	lv_obj_invalidate(screen);
+	lv_refr_now(lvglDisplay);
+}
+
+void initializeLvglUi()
+{
+	if (lvglReady || frameBuffer == nullptr)
+		return;
+	lv_init();
+	lv_tick_set_cb([]() -> uint32_t { return millis(); });
+	lvglDisplay = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+	lv_display_set_color_format(lvglDisplay, LV_COLOR_FORMAT_RGB565);
+	lv_display_set_flush_cb(lvglDisplay, lvglFlushDisplay);
+	lv_display_set_buffers(lvglDisplay, frameBuffer, nullptr,
+		static_cast<uint32_t>(SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(uint16_t)),
+		LV_DISPLAY_RENDER_MODE_FULL);
+	lvglTouchInput = lv_indev_create();
+	lv_indev_set_type(lvglTouchInput, LV_INDEV_TYPE_POINTER);
+	lv_indev_set_display(lvglTouchInput, lvglDisplay);
+	lv_indev_set_read_cb(lvglTouchInput, lvglReadTouch);
+	lvglReady = true;
+	renderLvglSplash();
+	Serial.println("[UI] LVGL 9.3 initialized");
+}
+
 void animateOrientationChange(bool desiredFlip)
 {
+	if (lvglReady)
+	{
+		displayFlipped = desiredFlip;
+		lv_obj_invalidate(lv_screen_active());
+		lv_refr_now(lvglDisplay);
+		return;
+	}
 	constexpr uint8_t collapseFrames[] = {100, 54, 10};
 	constexpr uint8_t expandFrames[] = {10, 54, 100};
 	for (uint8_t scale : collapseFrames)
@@ -661,9 +1803,135 @@ void startClockSync()
 {
 	if (!WiFi.isConnected() || clockSyncStarted)
 		return;
-	configTime(static_cast<long>(clockUtcOffsetMinutes) * 60L, 0, "pool.ntp.org", "time.nist.gov");
+	if (weatherTimezone.length())
+		configTzTime(weatherTimezone.c_str(), "pool.ntp.org", "time.nist.gov");
+	else
+		configTime(static_cast<long>(clockUtcOffsetMinutes) * 60L, 0, "pool.ntp.org", "time.nist.gov");
 	clockSyncStarted = true;
-	Serial.printf("[CLOCK] NTP requested with UTC offset %+d minutes\n", clockUtcOffsetMinutes);
+	Serial.printf("[CLOCK] NTP requested with %s\n",
+		weatherTimezone.length() ? weatherTimezone.c_str() : "the saved UTC offset");
+}
+
+String urlEncode(const String &value)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	String encoded;
+	encoded.reserve(value.length() * 3);
+	for (size_t index = 0; index < value.length(); ++index)
+	{
+		const uint8_t character = static_cast<uint8_t>(value[index]);
+		if (isalnum(character) || character == '-' || character == '_' || character == '.')
+			encoded += static_cast<char>(character);
+		else
+		{
+			encoded += '%';
+			encoded += hex[(character >> 4) & 0x0f];
+			encoded += hex[character & 0x0f];
+		}
+	}
+	return encoded;
+}
+
+String weatherConditionLabel(uint8_t code)
+{
+	if (code == 0)
+		return "CLEAR";
+	if (code <= 3)
+		return "CLOUDY";
+	if (code == 45 || code == 48)
+		return "FOG";
+	if (code >= 51 && code <= 67)
+		return "RAIN";
+	if (code >= 71 && code <= 77)
+		return "SNOW";
+	if (code >= 80 && code <= 82)
+		return "SHOWERS";
+	if (code >= 95)
+		return "STORM";
+	return "WEATHER";
+}
+
+bool resolveWeatherCity()
+{
+	if (weatherHasCoordinates || !weatherCity.length() || !WiFi.isConnected())
+		return weatherHasCoordinates;
+	WiFiClientSecure client;
+	client.setInsecure();
+	HTTPClient http;
+	const String url = "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=" +
+		urlEncode(weatherCity);
+	if (!http.begin(client, url))
+		return false;
+	http.setConnectTimeout(8000);
+	http.setTimeout(10000);
+	const int status = http.GET();
+	if (status != HTTP_CODE_OK)
+	{
+		http.end();
+		return false;
+	}
+	JsonDocument document;
+	const DeserializationError error = deserializeJson(document, http.getString());
+	http.end();
+	JsonObject result = document["results"][0].as<JsonObject>();
+	if (error || result.isNull())
+		return false;
+	weatherLatitude = result["latitude"] | 0.0F;
+	weatherLongitude = result["longitude"] | 0.0F;
+	weatherHasCoordinates = !(weatherLatitude == 0.0F && weatherLongitude == 0.0F);
+	return weatherHasCoordinates;
+}
+
+bool fetchWeatherNow()
+{
+	if (!WiFi.isConnected() || !resolveWeatherCity())
+		return false;
+	WiFiClientSecure client;
+	client.setInsecure();
+	HTTPClient http;
+	const String url = "https://api.open-meteo.com/v1/forecast?latitude=" +
+		String(weatherLatitude, 4) + "&longitude=" + String(weatherLongitude, 4) +
+		"&current=temperature_2m,wind_speed_10m,weather_code&timezone=auto";
+	if (!http.begin(client, url))
+		return false;
+	http.setConnectTimeout(8000);
+	http.setTimeout(10000);
+	const int status = http.GET();
+	if (status != HTTP_CODE_OK)
+	{
+		http.end();
+		return false;
+	}
+	JsonDocument document;
+	const DeserializationError error = deserializeJson(document, http.getString());
+	http.end();
+	JsonObject current = document["current"].as<JsonObject>();
+	if (error || current.isNull())
+		return false;
+	weatherTemperatureC = current["temperature_2m"] | weatherTemperatureC;
+	weatherWindKmh = current["wind_speed_10m"] | weatherWindKmh;
+	weatherCode = current["weather_code"] | weatherCode;
+	weatherHasData = true;
+	return true;
+}
+
+void maybeRefreshWeather()
+{
+	if (idleTheme == 0 || !WiFi.isConnected() || weatherFetchInProgress)
+		return;
+	if (lastWeatherFetchMs != 0 && millis() - lastWeatherFetchMs < WEATHER_REFRESH_INTERVAL_MS)
+		return;
+	weatherFetchInProgress = true;
+	const bool refreshed = fetchWeatherNow();
+	lastWeatherFetchMs = millis();
+	weatherFetchInProgress = false;
+	Serial.printf("[WEATHER] Refresh %s for %s\n",
+		refreshed ? "complete" : "failed", weatherCity.c_str());
+	if (refreshed && idleClockActive)
+	{
+		lastClockSecond = -1;
+		drawIdleClockScreen();
+	}
 }
 
 bool readLocalClock(tm &clockTime)
@@ -737,6 +2005,16 @@ void loadConfiguration()
 	mqttPassword = preferences.getString("mqtt_pass", "");
 	mqttTopicPrefix = preferences.getString("mqtt_topic", DEFAULT_MQTT_TOPIC_PREFIX);
 	clockUtcOffsetMinutes = preferences.getShort("clock_offset", 0);
+	idleTheme = min<uint8_t>(preferences.getUChar("idle_theme", 0), 2);
+	weatherCity = preferences.getString("wx_city", "Athens");
+	weatherTimezone = preferences.getString("wx_tz", "");
+	weatherLatitude = preferences.getFloat("wx_lat", 0.0F);
+	weatherLongitude = preferences.getFloat("wx_lon", 0.0F);
+	weatherHasCoordinates = preferences.getBool("wx_coords", false);
+	screenBrightnessPercent = constrain(
+		preferences.getUChar("brightness", DEFAULT_SCREEN_BRIGHTNESS), 10, 100);
+	soundVolumePercent = constrain(
+		preferences.getUChar("volume", DEFAULT_SOUND_VOLUME), 0, 100);
 	preferences.end();
 	mqttHost.trim();
 	mqttUsername.trim();
@@ -809,6 +2087,20 @@ bool savePortalConfiguration()
 	return true;
 }
 
+void saveDisplayConfiguration()
+{
+	preferences.begin("wpnotif", false);
+	preferences.putUChar("idle_theme", idleTheme);
+	preferences.putString("wx_city", weatherCity);
+	preferences.putString("wx_tz", weatherTimezone);
+	preferences.putFloat("wx_lat", weatherLatitude);
+	preferences.putFloat("wx_lon", weatherLongitude);
+	preferences.putBool("wx_coords", weatherHasCoordinates);
+	preferences.putUChar("brightness", screenBrightnessPercent);
+	preferences.putUChar("volume", soundVolumePercent);
+	preferences.end();
+}
+
 void configureSetupPortal()
 {
 	portalHeadHtml = NOTIFICATOR_TOUCH_PORTAL_HEAD;
@@ -855,15 +2147,124 @@ void startSetupPortal()
 	Serial.printf("[SETUP] Portal active: %s at 192.168.4.1\n", setupSsid.c_str());
 }
 
+void handleDeviceCommand(const String &json)
+{
+	JsonDocument document;
+	if (deserializeJson(document, json) != DeserializationError::Ok || !document.is<JsonObject>())
+		return;
+	const String command = document["cmd"] | "";
+	if (command == "idle_theme")
+	{
+		const int value = document["value"] | -1;
+		if (value < 0 || value > 2)
+			return;
+		idleTheme = static_cast<uint8_t>(value);
+		saveDisplayConfiguration();
+		lastWeatherFetchMs = 0;
+		lastClockSecond = -1;
+		if (idleClockActive)
+			drawIdleClockScreen();
+		Serial.printf("[DISPLAY] Idle theme changed to %u\n", idleTheme);
+		return;
+	}
+	if (command == "screen_brightness")
+	{
+		const int value = document["value"] | -1;
+		if (value < 0 || value > 100)
+			return;
+		// Keep a small visible floor so a remote command cannot make the on-device
+		// recovery controls unusable.
+		screenBrightnessPercent = static_cast<uint8_t>(max(10, value));
+		applyScreenBrightness();
+		saveDisplayConfiguration();
+		if (!idleClockActive && !wifiWizardActive)
+			renderLvglPage(currentPage);
+		return;
+	}
+	if (command == "sound_volume")
+	{
+		const int value = document["value"] | -1;
+		if (value < 0 || value > 100)
+			return;
+		soundVolumePercent = static_cast<uint8_t>(value);
+		applySoundVolume();
+		saveDisplayConfiguration();
+		if (!idleClockActive && !wifiWizardActive)
+			renderLvglPage(currentPage);
+		return;
+	}
+	if (command == "clear_msgs")
+	{
+		alertCount = 0;
+		selectedAlertIndex = 0;
+		if (!wifiWizardActive)
+			drawCurrentPage();
+		return;
+	}
+	if (command == "weather_config")
+	{
+		const bool hasLat = !document["lat"].isNull() || !document["latitude"].isNull();
+		const bool hasLon = !document["lon"].isNull() || !document["longitude"].isNull();
+		if (hasLat != hasLon)
+			return;
+		if (hasLat)
+		{
+			const float latitude = !document["lat"].isNull()
+				? document["lat"].as<float>() : document["latitude"].as<float>();
+			const float longitude = !document["lon"].isNull()
+				? document["lon"].as<float>() : document["longitude"].as<float>();
+			if (latitude < -90.0F || latitude > 90.0F || longitude < -180.0F || longitude > 180.0F)
+				return;
+			weatherLatitude = latitude;
+			weatherLongitude = longitude;
+			weatherHasCoordinates = true;
+		}
+		String city = document["city"] | document["location"] | "";
+		city.trim();
+		if (city.length())
+		{
+			if (city != weatherCity && !hasLat)
+				weatherHasCoordinates = false;
+			weatherCity = city.substring(0, 64);
+		}
+		String timezone = document["timezone"] | document["tz"] | "";
+		timezone.trim();
+		if (timezone.length())
+		{
+			weatherTimezone = timezone.substring(0, 64);
+			clockSyncStarted = false;
+			startClockSync();
+		}
+		weatherHasData = false;
+		lastWeatherFetchMs = 0;
+		saveDisplayConfiguration();
+		Serial.printf("[WEATHER] Configuration updated for %s\n", weatherCity.c_str());
+		return;
+	}
+	if (command == "ota")
+	{
+		const String channel = document["channel"] | NOTIFICATOR_OTA_DEFAULT_CHANNEL;
+		const bool force = document["force"] | false;
+		performOfficialOtaUpdate(channel, force);
+	}
+}
+
 void handleIncomingMqtt(char *topic, uint8_t *payload, unsigned int length)
 {
 	const String receivedTopic = String(topic ? topic : "");
-	if (receivedTopic != mqttMessageTopic && receivedTopic != mqttLegacyMessageTopic)
+	const bool commandMessage = receivedTopic == mqttCommandTopic ||
+		receivedTopic == mqttLegacyCommandTopic;
+	if (!commandMessage && receivedTopic != mqttMessageTopic && receivedTopic != mqttLegacyMessageTopic)
 		return;
 	String raw;
 	raw.reserve(length + 1);
 	for (unsigned int index = 0; index < length; ++index)
 		raw += static_cast<char>(payload[index]);
+	if (commandMessage)
+	{
+		handleDeviceCommand(raw);
+		return;
+	}
 
 	JsonDocument document;
 	const DeserializationError error = deserializeJson(document, raw);
@@ -872,7 +2273,8 @@ void handleIncomingMqtt(char *topic, uint8_t *payload, unsigned int length)
 		addAlert(
 			String(document["title"] | "NEW NOTIFICATION"),
 			String(document["body"] | document["message"] | "OPEN THE APP FOR DETAILS"),
-			String(document["site"] | document["source"] | "NOTIFICATOR"));
+			String(document["site"] | document["source"] | "NOTIFICATOR"),
+			String(document["severity"] | "info"));
 	}
 	else
 	{
@@ -881,7 +2283,8 @@ void handleIncomingMqtt(char *topic, uint8_t *payload, unsigned int length)
 	idleClockActive = false;
 	lastInteractionMs = millis();
 	currentPage = 1;
-	drawCurrentPage();
+	if (!wifiWizardActive)
+		drawCurrentPage();
 	playTestChime();
 	Serial.printf("[MQTT] Notification received on %s\n", mqttMessageTopic.c_str());
 }
@@ -896,7 +2299,11 @@ void configureMqttClient()
 	mqttClient.setCallback(handleIncomingMqtt);
 }
 
-bool publishDeviceStatus(const char *eventName = "online")
+bool publishDeviceStatus(
+	const char *eventName = "online",
+	const char *otaStatus = nullptr,
+	const String &targetVersion = "",
+	const String &error = "")
 {
 	if (!mqttClient.connected())
 		return false;
@@ -910,6 +2317,12 @@ bool publishDeviceStatus(const char *eventName = "online")
 	document["freeHeap"] = ESP.getFreeHeap();
 	document["rssi"] = WiFi.RSSI();
 	document["status"] = "ready";
+	if (otaStatus && otaStatus[0])
+		document["otaStatus"] = otaStatus;
+	if (targetVersion.length())
+		document["targetVersion"] = targetVersion;
+	if (error.length())
+		document["error"] = error;
 	if (batteryAvailable)
 	{
 		document["batteryPercent"] = batteryPercent;
@@ -919,6 +2332,277 @@ bool publishDeviceStatus(const char *eventName = "online")
 	serializeJson(document, payload);
 	lastMqttStatusMs = millis();
 	return mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
+}
+
+void drawOtaStatus(const String &title, const String &detail, int percent = -1)
+{
+	idleClockActive = false;
+	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BACKGROUND);
+	drawCenteredText(SCREEN_WIDTH / 2, 28, title, 4, COLOR_WHITE, COLOR_BACKGROUND);
+	drawCenteredText(SCREEN_WIDTH / 2, 78, detail, 2, COLOR_MUTED, COLOR_BACKGROUND);
+	if (percent >= 0)
+	{
+		fillRoundedRectangle(70, 122, 500, 18, 9, COLOR_PANEL_RAISED);
+		fillRoundedRectangle(70, 122, max(10, percent * 5), 18, 9, COLOR_BLUE);
+		drawCenteredText(SCREEN_WIDTH / 2, 148, String(percent) + "%", 2,
+			COLOR_BLUE_LIGHT, COLOR_BACKGROUND);
+	}
+	presentDisplay();
+}
+
+String normalizeOtaChannel(String channel)
+{
+	channel.trim();
+	channel.toLowerCase();
+	return channel == "preview" ? "preview" : String(NOTIFICATOR_OTA_DEFAULT_CHANNEL);
+}
+
+bool isSha256Hex(const String &value)
+{
+	if (value.length() != 64)
+		return false;
+	for (size_t index = 0; index < value.length(); ++index)
+		if (!((value[index] >= '0' && value[index] <= '9') ||
+			(value[index] >= 'a' && value[index] <= 'f')))
+			return false;
+	return true;
+}
+
+String sha256ToHex(const unsigned char digest[32])
+{
+	static const char alphabet[] = "0123456789abcdef";
+	char output[65];
+	for (size_t index = 0; index < 32; ++index)
+	{
+		output[index * 2] = alphabet[(digest[index] >> 4) & 0x0f];
+		output[index * 2 + 1] = alphabet[digest[index] & 0x0f];
+	}
+	output[64] = '\0';
+	return String(output);
+}
+
+bool fetchOfficialOtaRelease(const String &requestedChannel, OtaRelease &release, String &error)
+{
+	const String channel = normalizeOtaChannel(requestedChannel);
+	WiFiClientSecure client;
+	client.setCACert(MQTT_CA_CERT);
+	client.setTimeout(12000);
+	HTTPClient http;
+	http.setConnectTimeout(10000);
+	http.setTimeout(12000);
+	http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+	if (!http.begin(client, NOTIFICATOR_OTA_MANIFEST_URL))
+	{
+		error = "manifest_begin";
+		return false;
+	}
+	const int status = http.GET();
+	if (status != HTTP_CODE_OK)
+	{
+		error = "manifest_http_" + String(status);
+		http.end();
+		return false;
+	}
+	const String body = http.getString();
+	http.end();
+	if (!body.length() || body.length() > 16384)
+	{
+		error = "manifest_size";
+		return false;
+	}
+	JsonDocument document;
+	if (deserializeJson(document, body) != DeserializationError::Ok)
+	{
+		error = "manifest_json";
+		return false;
+	}
+	JsonObject entry = document["channels"][channel]["deviceTypes"]
+		[NOTIFICATOR_OTA_DEVICE_TYPE].as<JsonObject>();
+	if ((document["schemaVersion"] | 0) != 2 || entry.isNull())
+	{
+		error = "manifest_model";
+		return false;
+	}
+	release.channel = channel;
+	release.deviceType = entry["deviceType"] | "";
+	release.board = entry["board"] | "";
+	release.version = entry["version"] | "";
+	release.url = entry["url"] | "";
+	release.sha256 = entry["sha256"] | "";
+	release.size = entry["size"] | 0;
+	release.releasedAt = entry["releasedAt"] | "";
+	release.signature = entry["signature"] | "";
+	release.keyId = entry["keyId"] | "";
+	release.sha256.toLowerCase();
+	int major = 0;
+	int minor = 0;
+	int patch = 0;
+	const String algorithm = entry["signatureAlgorithm"] | "";
+	if (release.deviceType != NOTIFICATOR_OTA_DEVICE_TYPE ||
+		release.board != NOTIFICATOR_OTA_BOARD ||
+		!parseVersionTriplet(release.version, major, minor, patch) ||
+		!isValidOtaUrl(release.url) || !isSha256Hex(release.sha256) ||
+		release.size == 0 || release.size > 3145728 || !release.releasedAt.length() ||
+		release.keyId != NOTIFICATOR_OTA_KEY_ID || algorithm != "ECDSA-P256-SHA256")
+	{
+		error = "manifest_fields";
+		return false;
+	}
+	const String signedPayload = buildOtaReleaseSignBase(
+		release.channel, release.deviceType, release.board, release.version,
+		release.url, release.sha256, release.size, release.releasedAt);
+	if (!verifyOtaReleaseSignature(
+			NOTIFICATOR_OTA_PUBLIC_KEY_PEM, signedPayload, release.signature))
+	{
+		error = "manifest_signature";
+		return false;
+	}
+	return true;
+}
+
+bool streamVerifiedOtaImage(const OtaRelease &release, String &error)
+{
+	WiFiClientSecure client;
+	client.setCACert(MQTT_CA_CERT);
+	client.setTimeout(12000);
+	HTTPClient http;
+	http.setConnectTimeout(10000);
+	http.setTimeout(12000);
+	http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+	if (!http.begin(client, release.url))
+	{
+		error = "binary_begin";
+		return false;
+	}
+	const int status = http.GET();
+	if (status != HTTP_CODE_OK)
+	{
+		error = "binary_http_" + String(status);
+		http.end();
+		return false;
+	}
+	const int contentLength = http.getSize();
+	if (contentLength > 0 && static_cast<size_t>(contentLength) != release.size)
+	{
+		error = "binary_size";
+		http.end();
+		return false;
+	}
+	if (!Update.begin(release.size, U_FLASH))
+	{
+		error = "update_begin_" + String(Update.getError());
+		http.end();
+		return false;
+	}
+	mbedtls_sha256_context sha;
+	mbedtls_sha256_init(&sha);
+	if (mbedtls_sha256_starts(&sha, 0) != 0)
+	{
+		error = "sha_begin";
+		mbedtls_sha256_free(&sha);
+		Update.abort();
+		http.end();
+		return false;
+	}
+	WiFiClient *stream = http.getStreamPtr();
+	unsigned char buffer[2048];
+	size_t received = 0;
+	unsigned long lastDataAt = millis();
+	int lastPercent = -1;
+	while (received < release.size)
+	{
+		const int available = stream->available();
+		if (available <= 0)
+		{
+			if (!stream->connected() || millis() - lastDataAt > 12000)
+			{
+				error = "binary_timeout";
+				break;
+			}
+			delay(2);
+			continue;
+		}
+		const size_t wanted = min(
+			release.size - received,
+			static_cast<size_t>(min(available, static_cast<int>(sizeof(buffer)))));
+		const size_t count = stream->readBytes(buffer, wanted);
+		if (!count)
+			continue;
+		lastDataAt = millis();
+		if (mbedtls_sha256_update(&sha, buffer, count) != 0 ||
+			Update.write(buffer, count) != count)
+		{
+			error = "binary_write";
+			break;
+		}
+		received += count;
+		const int percent = static_cast<int>((received * 100ULL) / release.size);
+		if (percent != lastPercent && (percent % 2 == 0 || percent == 100))
+		{
+			lastPercent = percent;
+			drawOtaStatus("UPDATING", release.version, percent);
+		}
+	}
+	unsigned char digest[32];
+	const bool digestReady = !error.length() && received == release.size &&
+		mbedtls_sha256_finish(&sha, digest) == 0;
+	mbedtls_sha256_free(&sha);
+	if (!digestReady || !otaSecureHexEquals(release.sha256, sha256ToHex(digest)))
+	{
+		if (!error.length())
+			error = digestReady ? "binary_hash" : "binary_incomplete";
+		Update.abort();
+		http.end();
+		return false;
+	}
+	if (!Update.end() || !Update.isFinished())
+	{
+		error = "update_end_" + String(Update.getError());
+		Update.abort();
+		http.end();
+		return false;
+	}
+	http.end();
+	return true;
+}
+
+void performOfficialOtaUpdate(const String &requestedChannel, bool force)
+{
+	if (!WiFi.isConnected())
+		return;
+	drawOtaStatus("FIRMWARE", "CHECKING RELEASE");
+	OtaRelease release;
+	String error;
+	if (!fetchOfficialOtaRelease(requestedChannel, release, error))
+	{
+		publishDeviceStatus("ota_result", "failed", "", error);
+		drawOtaStatus("UPDATE FAILED", error);
+		delay(1600);
+		drawCurrentPage();
+		return;
+	}
+	if (!force && !isRemoteVersionNewer(FIRMWARE_VERSION, release.version))
+	{
+		publishDeviceStatus("ota_result", "no_update", release.version);
+		drawOtaStatus("UP TO DATE", FIRMWARE_VERSION);
+		delay(1300);
+		drawCurrentPage();
+		return;
+	}
+	publishDeviceStatus("ota_result", "updating", release.version);
+	drawOtaStatus("FIRMWARE", "STARTING", 0);
+	if (!streamVerifiedOtaImage(release, error))
+	{
+		publishDeviceStatus("ota_result", "failed", release.version, error);
+		drawOtaStatus("UPDATE FAILED", error);
+		delay(1800);
+		drawCurrentPage();
+		return;
+	}
+	publishDeviceStatus("ota_result", "restarting", release.version);
+	drawOtaStatus("UPDATE READY", "RESTARTING", 100);
+	delay(1200);
+	ESP.restart();
 }
 
 void connectMqtt()
@@ -1382,6 +3066,35 @@ void pulseBacklight()
 	digitalWrite(LCD_PIN_BACKLIGHT, LOW);
 }
 
+/** Drive the active-low LCD backlight with flicker-free PWM. */
+void applyScreenBrightness()
+{
+	static bool pwmAttached = false;
+	if (!pwmAttached)
+	{
+		pwmAttached = ledcAttach(LCD_PIN_BACKLIGHT, 20000, 8);
+		if (!pwmAttached)
+		{
+			Serial.println("[DISPLAY] Backlight PWM could not be attached");
+			return;
+		}
+	}
+
+	const uint8_t activeLowDuty = static_cast<uint8_t>(
+		(100 - screenBrightnessPercent) * 255 / 100);
+	ledcWrite(LCD_PIN_BACKLIGHT, activeLowDuty);
+	Serial.printf("[DISPLAY] Brightness set to %u%%\n", screenBrightnessPercent);
+}
+
+/** Apply the saved output level to the ES8311 playback path. */
+void applySoundVolume()
+{
+	if (audioPlayback == nullptr)
+		return;
+	esp_codec_dev_set_out_vol(audioPlayback, static_cast<float>(soundVolumePercent));
+	Serial.printf("[AUDIO] Volume set to %u%%\n", soundVolumePercent);
+}
+
 void drawBrandMark(int x, int y, int size, uint16_t background)
 {
 	fillRoundedRectangle(x, y, size, size, size / 4, COLOR_BLUE);
@@ -1441,6 +3154,11 @@ void drawBottomNavigation(uint8_t active)
 
 void drawBootSplash()
 {
+	if (lvglReady)
+	{
+		renderLvglSplash();
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BLUE);
 	fillCircle(92, 86, 54, COLOR_BLUE_LIGHT);
 	drawBrandMark(61, 55, 62, COLOR_BLUE);
@@ -1452,6 +3170,11 @@ void drawBootSplash()
 
 void drawSetupScreen(const String &state)
 {
+	if (lvglReady)
+	{
+		renderLvglSetup(state);
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BACKGROUND);
 	fillRoundedRectangle(10, 10, 194, 152, 16, COLOR_BLUE);
 	drawBrandMark(26, 26, 34, COLOR_BLUE);
@@ -1472,6 +3195,11 @@ void drawSetupScreen(const String &state)
 
 void drawDashboardScreen()
 {
+	if (lvglReady)
+	{
+		renderLvglPage(0);
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BACKGROUND);
 	drawAppHeader("HOME");
 
@@ -1498,6 +3226,11 @@ void drawDashboardScreen()
 
 void drawNotificationsScreen()
 {
+	if (lvglReady)
+	{
+		renderLvglPage(1);
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BACKGROUND);
 	drawAppHeader("ALERTS");
 	NotificationPreview *alert = selectedAlert();
@@ -1512,8 +3245,11 @@ void drawNotificationsScreen()
 	else
 	{
 		fillRoundedRectangle(10, 50, 620, 86, 14, COLOR_PANEL_RAISED);
-		fillRectangle(10, 62, 5, 62, alert->unread ? COLOR_BLUE_LIGHT : COLOR_GREEN);
+		const uint16_t severityColor = alert->severity == "critical" ? COLOR_RED :
+			alert->severity == "warning" ? COLOR_AMBER : COLOR_BLUE_LIGHT;
+		fillRectangle(10, 62, 5, 62, severityColor);
 		drawText(26, 58, alert->source, 1, COLOR_BLUE_LIGHT, COLOR_PANEL_RAISED);
+		drawText(548, 58, alert->receivedAt, 1, COLOR_MUTED, COLOR_PANEL_RAISED);
 		drawText(26, 78, alert->title, 2, COLOR_WHITE, COLOR_PANEL_RAISED);
 		drawText(26, 103, alert->body, 1, COLOR_MUTED, COLOR_PANEL_RAISED);
 		drawText(28, 122, String(selectedAlertIndex + 1) + " OF " + String(alertCount), 1,
@@ -1533,6 +3269,11 @@ void drawNotificationsScreen()
 
 void drawDeviceScreen()
 {
+	if (lvglReady)
+	{
+		renderLvglPage(2);
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BACKGROUND);
 	drawAppHeader("DEVICE");
 	const String batteryText = batteryAvailable ? String(batteryPercent) + "%" : "USB";
@@ -1557,11 +3298,12 @@ void drawDeviceScreen()
 
 void drawIdleClockScreen()
 {
+	if (lvglReady)
+	{
+		renderLvglClock();
+		return;
+	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BLACK);
-
-	if (batteryAvailable)
-		drawText(574, 13, String(batteryPercent) + "%", 2,
-			batteryPercent <= 15 ? COLOR_RED : COLOR_MUTED, COLOR_BLACK);
 
 	tm clockTime = {};
 	if (readLocalClock(clockTime))
@@ -1589,6 +3331,14 @@ void drawIdleClockScreen()
 
 void drawCurrentPage()
 {
+	if (lvglReady)
+	{
+		if (idleClockActive)
+			renderLvglClock();
+		else
+			renderLvglPage(currentPage);
+		return;
+	}
 	if (idleClockActive)
 	{
 		drawIdleClockScreen();
@@ -1870,11 +3620,14 @@ void setup()
 		Serial.println("[FAIL] Display initialization failed");
 		return;
 	}
+	initializeLvglUi();
 	drawBootSplash();
 	audioReady = initializeAudio();
 	delay(900);
 
 	loadConfiguration();
+	applyScreenBrightness();
+	applySoundVolume();
 	configureSetupPortal();
 	configureMqttClient();
 	WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t)
@@ -1908,8 +3661,31 @@ void loop()
 		delay(250);
 		return;
 	}
+	if (lvglReady)
+		lv_timer_handler();
 	updateOrientation();
 	updateButtons();
+
+	if (wifiWizardActive && wifiWizardStage == WifiWizardStage::Connecting)
+	{
+		if (WiFi.isConnected() && WiFi.SSID() == pendingWifiSsid)
+		{
+			wifiWizardStage = WifiWizardStage::Success;
+			clockSyncStarted = false;
+			lastMqttAttemptMs = 0;
+			networkStateChanged = false;
+			Serial.printf("[WIFI] Connection accepted: %s\n", pendingWifiSsid.c_str());
+			renderWifiResult(true);
+		}
+		else if (millis() - wifiConnectStartedMs >= WIFI_WIZARD_TIMEOUT_MS)
+		{
+			wifiWizardStage = WifiWizardStage::Failed;
+			restorePreviousWifi();
+			networkStateChanged = false;
+			Serial.printf("[WIFI] Connection test failed: %s\n", pendingWifiSsid.c_str());
+			renderWifiResult(false);
+		}
+	}
 
 	if (portalRunning)
 	{
@@ -1958,72 +3734,83 @@ void loop()
 				publishDeviceStatus("heartbeat");
 		}
 	}
+	if (!wifiWizardActive && !portalRunning)
+		maybeRefreshWeather();
 
 	if (millis() - lastBatterySampleMs >= BATTERY_SAMPLE_INTERVAL_MS)
 	{
 		const bool batteryDisplayChanged = sampleBatteryLevel();
-		if (batteryDisplayChanged)
+		if (batteryDisplayChanged && !wifiWizardActive)
 			drawCurrentPage();
 	}
 
 	if (networkStateChanged)
 	{
 		networkStateChanged = false;
-		drawCurrentPage();
+		if (!wifiWizardActive)
+			drawCurrentPage();
 	}
 
 	// A gentle green pulse communicates an actively serviced MQTT keepalive.
 	// Stop repainting in clock mode so the idle display remains still and dark.
-	if (!idleClockActive && mqttClient.connected() &&
+	if (!lvglReady && !idleClockActive && mqttClient.connected() &&
 		millis() - lastMqttPulseRenderMs >= MQTT_PULSE_INTERVAL_MS)
 	{
 		lastMqttPulseRenderMs = millis();
 		drawCurrentPage();
 	}
 
-	uint16_t x = 0;
-	uint16_t y = 0;
-	uint8_t points = 0;
-	if (readTouch(x, y, points))
+	if (!lvglReady)
 	{
-		missedTouchReads = 0;
-		if (idleClockActive)
+		uint16_t x = 0;
+		uint16_t y = 0;
+		uint8_t points = 0;
+		if (readTouch(x, y, points))
 		{
-			noteUserInteraction();
+			missedTouchReads = 0;
+			if (idleClockActive)
+			{
+				noteUserInteraction();
+				touchActive = false;
+				delay(80);
+				return;
+			}
+			if (!touchActive)
+			{
+				touchActive = true;
+				touchStartX = x;
+				touchStartY = y;
+			}
+			touchLastX = x;
+			touchLastY = y;
+			if (millis() - lastTouchLogMs >= 80)
+			{
+				Serial.printf("[TOUCH] points=%u x=%u y=%u\n", points, x, y);
+				lastTouchLogMs = millis();
+			}
+		}
+		else if (touchActive && ++missedTouchReads >= 2)
+		{
 			touchActive = false;
-			delay(80);
-			return;
+			missedTouchReads = 0;
+			handleCompletedTouch();
 		}
-		if (!touchActive)
-		{
-			touchActive = true;
-			touchStartX = x;
-			touchStartY = y;
-		}
-		touchLastX = x;
-		touchLastY = y;
-		if (millis() - lastTouchLogMs >= 80)
-		{
-			Serial.printf("[TOUCH] points=%u x=%u y=%u\n", points, x, y);
-			lastTouchLogMs = millis();
-		}
-	}
-	else if (touchActive && ++missedTouchReads >= 2)
-	{
-		touchActive = false;
-		missedTouchReads = 0;
-		handleCompletedTouch();
 	}
 
-	if (!idleClockActive && !touchActive && millis() - lastInteractionMs >= IDLE_CLOCK_TIMEOUT_MS)
+	if (!wifiWizardActive && !idleClockActive && !touchActive &&
+		millis() - lastInteractionMs >= IDLE_CLOCK_TIMEOUT_MS)
 	{
 		idleClockActive = true;
+		lastClockSecond = -1;
 		drawIdleClockScreen();
 	}
 	else if (idleClockActive)
 	{
 		tm clockTime = {};
-		if (readLocalClock(clockTime) && clockTime.tm_min != lastClockMinute)
+		const int currentSecond = readLocalClock(clockTime)
+			? clockTime.tm_sec
+			: static_cast<int>((millis() / 1000) % 60);
+		if (currentSecond != lastClockSecond)
 			drawIdleClockScreen();
 	}
 

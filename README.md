@@ -32,15 +32,31 @@ Each production model owns its hardware definition, build dependencies, embedded
 verification key, and release artifacts. Code should move into a shared module
 only after two model implementations genuinely use it.
 
-The Notificator Base sketch is:
+## Supported firmware models
+
+| Model | Hardware | Status | Version | OTA channel |
+| --- | --- | --- | --- | --- |
+| Notificator Base | ESP32-C3 SuperMini, SSD1306 OLED, TTP223 touch | Stable | `1.2.1` | `stable` |
+| Notificator Touch 3.49 | Waveshare ESP32-S3 Touch LCD 3.49 | Preview | `0.9.1` | `preview` |
+| Notificator Matter | To be announced | Planned | — | — |
+
+Production sketches:
+
 - `models/notificator_base/notificator_base.ino`
+- `models/notificator_touch_349/notificator_touch_349.ino`
+
+Touch has its own [model README](models/notificator_touch_349/README.md) with
+board controls, setup behavior, UI details, and build settings.
 
 For the source boundaries, runtime flow, MQTT contract, stored configuration,
 OTA security model, and release checklist, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## What This Firmware Does
 
-This firmware runs on an ESP32-C3 device with an SSD1306 OLED and a TTP223 capacitive touch sensor.
+The models share the same secure MQTT and signed OTA contract while retaining
+hardware-specific interfaces. Base uses a compact OLED and capacitive gesture
+control. Touch uses a 640 × 172 capacitive display, audio output, orientation
+sensing, an on-device Wi-Fi keyboard, and clock/weather modes.
 
 Core capabilities:
 - Connects to Wi-Fi using a setup portal (WiFiManager).
@@ -50,12 +66,26 @@ Core capabilities:
 - Uses touch-first notification gestures.
 - Supports model-specific, signed HTTPS OTA releases with progress and MQTT status reporting.
 
-## Hardware Target
+## Notificator Base hardware
 
 Designed for:
 - ESP32-C3 SuperMini
 - SSD1306 OLED (128x64, I2C, address `0x3C`)
 - TTP223 capacitive touch sensor
+
+## Notificator Touch 3.49 hardware
+
+Designed for the
+[Waveshare ESP32-S3 Touch LCD 3.49](https://www.waveshare.com/esp32-s3-touch-lcd-3.49.htm):
+
+- ESP32-S3 with 16 MB flash and octal PSRAM
+- 3.49-inch 172 × 640 capacitive touch display
+- ES8311 audio codec and onboard speaker path
+- QMI8658 orientation sensor
+- Battery input and physical BOOT, power, and reset controls
+
+Touch is a preview target. Its signed OTA releases use a separate channel so
+they cannot be selected by Base devices.
 
 ## Notificator Base enclosure
 
@@ -214,16 +244,16 @@ open the local `WPNOTIF-<deviceId>` setup network and enter Wi-Fi and HiveMQ
 details again. Once setup is complete, future releases should normally be
 installed through the firmware's authenticated OTA flow.
 
-GitHub Actions compiles the current Notificator Base source, verifies that the
-output is a complete merged image, assembles the static installer, and deploys
-it to GitHub Pages. Generated binaries remain build artifacts and are not
-committed to the repository.
+GitHub Actions compiles Base and Touch, verifies their complete merged images,
+assembles the two-model installer, and deploys it to GitHub Pages. Generated
+binaries remain build artifacts and are not committed to the source repository.
 
-To prepare the installer locally after an Arduino CLI build:
+To prepare the installer locally after building both models:
 
 ```bash
 scripts/prepare-web-installer.sh \
   build/notificator-base/notificator_base.ino.merged.bin \
+  build/notificator-touch-349/notificator_touch_349.ino.merged.bin \
   build/web-installer
 ```
 
@@ -256,6 +286,7 @@ To build in Arduino IDE or PlatformIO, you need:
 - ArduinoJson
 - Adafruit GFX Library
 - Adafruit SSD1306
+- LVGL 9.3.0 for Notificator Touch
 
 Arduino CLI example:
 
@@ -264,6 +295,11 @@ arduino-cli compile \
   --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashSize=4M" \
   --output-dir build/notificator-base \
   models/notificator_base
+
+arduino-cli compile \
+  --fqbn "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=qio" \
+  --output-dir build/notificator-touch-349 \
+  models/notificator_touch_349
 ```
 
 Publish compiled binaries as release artifacts rather than committing generated
@@ -271,9 +307,15 @@ build output. OTA manifest entries and URLs must always use the corresponding
 model ID and board ID.
 
 To publish an official version, update the source and installer metadata, then
-publish a matching `vX.Y.Z` GitHub release. The firmware workflow compiles the
-source, deploys the web installer, and attaches versioned OTA and factory
-binaries to the release. The private API repository's manually started
+publish a model-prefixed GitHub release:
+
+- Base: `base-vX.Y.Z`
+- Touch: `touch-vX.Y.Z`
+
+Legacy `vX.Y.Z` tags remain supported as Base releases. The firmware workflow
+compiles both models, deploys the web installer, and attaches the selected
+model's versioned OTA and factory binaries to the release. The private API
+repository's manually started
 **Publish signed firmware** workflow then downloads that OTA asset and signs
 the public release manifest inside its protected `firmware-production`
 environment. The private signing key never belongs in this repository.
@@ -298,15 +340,22 @@ devices can receive an authenticated OTA command, but ordinary commands and
 MQTT notification delivery remain blocked until the device reports `1.2.0` or
 newer.
 
-## Version Info
+## Version info
 
-Current firmware metadata in source:
+Current Base metadata:
 - Model name: `Notificator Base`
 - Model ID: `notificator_base`
 - Board ID: `esp32c3-supermini-oled`
 - Firmware name: `Notificator Base Firmware`
-- Firmware version: `1.2.0`
-- Firmware date: `2026-08-01`
+- Firmware version: `1.2.1`
+- Firmware date: `2026-08-05`
+
+Current Touch metadata:
+
+- Model name: `Notificator Touch 3.49`
+- Model ID: `notificator_touch_349`
+- Board ID: `waveshare-esp32-s3-touch-lcd-3.49`
+- Firmware version: `0.9.1 Preview`
 
 ## License
 

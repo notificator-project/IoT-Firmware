@@ -115,6 +115,7 @@ jobs:
             --clobber
 
       - name: Assemble web installer
+        if: github.event_name == 'workflow_dispatch'
         run: |
           chmod +x scripts/prepare-web-installer.sh
           scripts/prepare-web-installer.sh \
@@ -123,14 +124,17 @@ jobs:
             _site
 
       - name: Configure GitHub Pages
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
   deploy:
+    if: github.event_name == 'workflow_dispatch'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

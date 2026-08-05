@@ -73,6 +73,23 @@ Designed for:
 - SSD1306 OLED (128x64, I2C, address `0x3C`)
 - TTP223 capacitive touch sensor
 
+<table>
+  <tr>
+    <td width="50%">
+      <img src="hardware/showcase/notificator-base-alert.png" alt="Rendered Notificator Base device showing an alert" width="100%">
+    </td>
+    <td width="50%">
+      <img src="hardware/showcase/notificator-base-weather.png" alt="Rendered Notificator Base device showing its clock and weather screen" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Alert view</strong></td>
+    <td align="center"><strong>Clock and weather</strong></td>
+  </tr>
+</table>
+
+_Interface renders showing the current Base firmware experience._
+
 ## Notificator Touch 3.49 hardware
 
 Designed for the
@@ -87,13 +104,26 @@ Designed for the
 Touch is a preview target. Its signed OTA releases use a separate channel so
 they cannot be selected by Base devices.
 
+<table>
+  <tr>
+    <td width="50%">
+      <img src="hardware/showcase/notificator-touch-home.png" alt="Rendered Notificator Touch device showing its home screen" width="100%">
+    </td>
+    <td width="50%">
+      <img src="hardware/showcase/notificator-touch-clock.png" alt="Rendered Notificator Touch device showing its clock and weather screen" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Touch home</strong></td>
+    <td align="center"><strong>Clock and weather</strong></td>
+  </tr>
+</table>
+
+_Interface renders showing the current Touch preview experience._
+
 ## Notificator Base enclosure
 
 Notificator Base enclosures are 3D printed using a [Bambu Lab](https://bambulab.com) printer and [Bambu Lab PLA](https://bambulab.com/en/filament) filament.
-
-The photo below shows color variants from the first community batch.
-
-![Batch of Notificator Base devices](hardware/notificator_base/NotificatorBaseDevices.jpeg)
 
 Devices from the first community batch were shipped free to selected community members.
 

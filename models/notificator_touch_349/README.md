@@ -4,7 +4,7 @@
 ESP32-S3-Touch-LCD-3.49. It is separate from the hardware diagnostic so factory
 and field troubleshooting can continue without changing the user-facing model.
 
-The current public-development firmware is **0.9.2 Preview**. Touch remains a
+The current public-development firmware is **0.9.3 Preview**. Touch remains a
 pre-1.0 model while its interaction design and field-update flow are validated.
 
 ## Current development slice
@@ -80,6 +80,8 @@ blank submission keeps the password already stored on the device.
   are stored on the device and can also be changed from the mobile app.
 - Tap an unread alert to mark its local preview as read. Use **Newer** and
   **Older** to browse the six most recent alerts kept in memory.
+- The mobile app's **Mark All Read** action clears the unread state across the
+  complete local alert inbox without deleting its messages.
 - Leave the display untouched for 60 seconds to enter the clock screen; any
   touch, notification, or physical button wakes it. Battery percentage stays
   hidden on this ambient view to keep the clock and weather presentation clean.

@@ -1,6 +1,6 @@
 {
 	"name": "Notificator Base",
-	"version": "1.2.1",
+	"version": "1.2.2",
 	"funding_url": "https://buymeacoffee.com/vagelis",
 	"new_install_prompt_erase": false,
 	"new_install_improv_wait_time": 0,
@@ -10,7 +10,7 @@
 			"improv": false,
 			"parts": [
 				{
-					"path": "../firmware/notificator-base-1.2.1.factory.bin",
+					"path": "../firmware/notificator-base-1.2.2.factory.bin",
 					"offset": 0
 				}
 			]

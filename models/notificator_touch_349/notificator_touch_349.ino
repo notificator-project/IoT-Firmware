@@ -44,14 +44,15 @@
 
 namespace
 {
-constexpr char FIRMWARE_VERSION[] = "0.9.2";
-constexpr char FIRMWARE_LABEL[] = "0.9.2 PREVIEW";
+constexpr char FIRMWARE_VERSION[] = "0.9.3";
+constexpr char FIRMWARE_LABEL[] = "0.9.3 PREVIEW";
 constexpr char MODEL_ID[] = "notificator_touch_349";
 constexpr char WIFI_AP_PREFIX[] = "WPNOTIF-";
 constexpr char DEFAULT_MQTT_TOPIC_PREFIX[] = "notificator-project";
 constexpr uint16_t DEFAULT_MQTT_PORT = 8883;
 constexpr unsigned long MQTT_RECONNECT_MS = 5000;
 constexpr unsigned long MQTT_STATUS_INTERVAL_MS = 60000;
+constexpr uint16_t MQTT_KEEP_ALIVE_SECONDS = 20;
 constexpr unsigned long MQTT_HEALTH_GRACE_MS = 5000;
 constexpr unsigned long MQTT_PULSE_INTERVAL_MS = 1000;
 constexpr unsigned long BATTERY_SAMPLE_INTERVAL_MS = 30000;
@@ -2204,6 +2205,15 @@ void handleDeviceCommand(const String &json)
 			drawCurrentPage();
 		return;
 	}
+	if (command == "mark_all_read")
+	{
+		for (uint8_t index = 0; index < alertCount; ++index)
+			alertHistory[index].unread = false;
+		if (!wifiWizardActive)
+			drawCurrentPage();
+		Serial.println("[ALERTS] All messages marked as read");
+		return;
+	}
 	if (command == "weather_config")
 	{
 		const bool hasLat = !document["lat"].isNull() || !document["latitude"].isNull();
@@ -2299,6 +2309,7 @@ void configureMqttClient()
 	mqttTlsClient.setCACert(MQTT_CA_CERT);
 	mqttClient.setServer(mqttHost.c_str(), mqttPort);
 	mqttClient.setBufferSize(1024);
+	mqttClient.setKeepAlive(MQTT_KEEP_ALIVE_SECONDS);
 	mqttClient.setCallback(handleIncomingMqtt);
 }
 
@@ -2333,8 +2344,26 @@ bool publishDeviceStatus(
 	}
 	String payload;
 	serializeJson(document, payload);
-	lastMqttStatusMs = millis();
-	return mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
+	const bool published = mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
+	if (published)
+		lastMqttStatusMs = millis();
+	return published;
+}
+
+/** Build the retained Last Will payload published by HiveMQ on power loss. */
+String buildMqttOfflinePayload()
+{
+	JsonDocument document;
+	document["type"] = "device_telemetry";
+	document["event"] = "offline";
+	document["deviceId"] = deviceId;
+	document["firmwareVersion"] = FIRMWARE_VERSION;
+	document["model"] = MODEL_ID;
+	document["status"] = "offline";
+	String payload;
+	payload.reserve(224);
+	serializeJson(document, payload);
+	return payload;
 }
 
 void drawOtaStatus(const String &title, const String &detail, int percent = -1)
@@ -2613,7 +2642,15 @@ void connectMqtt()
 	if (mqttClient.connected() || !WiFi.isConnected() || !mqttConfigValid)
 		return;
 	const String clientId = "notificator-touch-" + deviceId;
-	if (mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str()))
+	const String offlinePayload = buildMqttOfflinePayload();
+	if (mqttClient.connect(
+		clientId.c_str(),
+		mqttUsername.c_str(),
+		mqttPassword.c_str(),
+		mqttStatusTopic.c_str(),
+		1,
+		true,
+		offlinePayload.c_str()))
 	{
 		lastMqttHealthMs = millis();
 		mqttClient.subscribe(mqttMessageTopic.c_str(), 1);

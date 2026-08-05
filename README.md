@@ -36,8 +36,8 @@ only after two model implementations genuinely use it.
 
 | Model | Hardware | Status | Version | OTA channel |
 | --- | --- | --- | --- | --- |
-| Notificator Base | ESP32-C3 SuperMini, SSD1306 OLED, TTP223 touch | Stable | `1.2.1` | `stable` |
-| Notificator Touch 3.49 | Waveshare ESP32-S3 Touch LCD 3.49 | Preview | `0.9.2` | `preview` |
+| Notificator Base | ESP32-C3 SuperMini, SSD1306 OLED, TTP223 touch | Stable | `1.2.2` | `stable` |
+| Notificator Touch 3.49 | Waveshare ESP32-S3 Touch LCD 3.49 | Preview | `0.9.3` | `preview` |
 | Notificator Matter | To be announced | Planned | — | — |
 
 Production sketches:
@@ -196,6 +196,11 @@ It publishes retained device and OTA status to:
 
 - `<topic-prefix>/<deviceId>/status`
 
+Base and Touch refresh the retained online status every 60 seconds and register
+a retained offline Last Will with HiveMQ. This allows the mobile app to detect
+unexpected power or network loss without requiring the device to send a final
+message itself.
+
 The default topic prefix for new configurations is `notificator-project`.
 Devices with a saved prefix keep their existing value. Credentials are stored
 in the ESP32's local NVS preferences, and saved passwords are never echoed into
@@ -347,15 +352,15 @@ Current Base metadata:
 - Model ID: `notificator_base`
 - Board ID: `esp32c3-supermini-oled`
 - Firmware name: `Notificator Base Firmware`
-- Firmware version: `1.2.1`
-- Firmware date: `2026-08-05`
+- Firmware version: `1.2.2`
+- Firmware date: `2026-08-06`
 
 Current Touch metadata:
 
 - Model name: `Notificator Touch 3.49`
 - Model ID: `notificator_touch_349`
 - Board ID: `waveshare-esp32-s3-touch-lcd-3.49`
-- Firmware version: `0.9.2 Preview`
+- Firmware version: `0.9.3 Preview`
 
 ## License
 

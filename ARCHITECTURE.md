@@ -152,6 +152,13 @@ OTA lifecycle messages additionally use `otaStatus` and can contain
 `targetVersion` and `error`.
 The exact heap and signal values above are illustrative.
 
+Both production models publish a retained heartbeat every 60 seconds and
+register a retained MQTT Last Will payload with `event` and `status` set to
+`offline`. HiveMQ publishes that Last Will when a connection disappears without
+a clean disconnect, including an unexpected power loss. With the 20-second
+keepalive and the mobile app's 30-second foreground status refresh, presence
+normally changes to offline within roughly 30–60 seconds.
+
 ## External Network Requests
 
 The normal notification path uses the user-configured HiveMQ broker. Weather

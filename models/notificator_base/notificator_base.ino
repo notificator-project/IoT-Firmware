@@ -40,8 +40,8 @@
  * release behavior changes.
  */
 #define FW_NAME "Notificator Base Firmware"
-#define FW_VERSION "1.2.1"
-#define FW_VERSION_DATE "2026-08-05"
+#define FW_VERSION "1.2.2"
+#define FW_VERSION_DATE "2026-08-06"
 
 /*
   Notificator Base ESP32-C3 firmware
@@ -143,6 +143,9 @@ PubSubClient mqttClient(tlsClient);
 
 unsigned long lastMqttAttemptMs = 0;
 static const unsigned long MQTT_RECONNECT_MS = 2000;
+static const unsigned long MQTT_STATUS_INTERVAL_MS = 60000;
+static const uint16_t MQTT_KEEP_ALIVE_SECONDS = 20;
+unsigned long lastMqttStatusMs = 0;
 String mqttHost;
 uint16_t mqttPort = DEFAULT_MQTT_PORT;
 String mqttUsername;
@@ -2499,7 +2502,25 @@ bool publishDeviceStatus(const char *eventName, const char *status, const String
 	String payload;
 	payload.reserve(280);
 	serializeJson(doc, payload);
-	return mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
+	const bool published = mqttClient.publish(mqttStatusTopic.c_str(), payload.c_str(), true);
+	if (published)
+		lastMqttStatusMs = millis();
+	return published;
+}
+
+/** Build the retained Last Will payload published by the broker on power loss. */
+String buildMqttOfflinePayload()
+{
+	StaticJsonDocument<224> doc;
+	doc["type"] = "device_telemetry";
+	doc["event"] = "offline";
+	doc["deviceId"] = deviceId;
+	doc["firmwareVersion"] = FW_VERSION;
+	doc["status"] = "offline";
+	String payload;
+	payload.reserve(192);
+	serializeJson(doc, payload);
+	return payload;
 }
 
 namespace
@@ -3033,6 +3054,7 @@ void setupMqttClient()
 
 	mqttClient.setServer(mqttHost.c_str(), mqttPort);
 	mqttClient.setBufferSize(1024);
+	mqttClient.setKeepAlive(MQTT_KEEP_ALIVE_SECONDS);
 
 	mqttClient.setCallback([](char *topic, uint8_t *payload, unsigned int length)
 						   {
@@ -3139,7 +3161,15 @@ void connectToMqtt()
 		return;
 
 	const String clientId = String("notificator-") + deviceId;
-	bool connected = mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
+	const String offlinePayload = buildMqttOfflinePayload();
+	bool connected = mqttClient.connect(
+		clientId.c_str(),
+		mqttUsername.c_str(),
+		mqttPassword.c_str(),
+		mqttStatusTopic.c_str(),
+		1,
+		true,
+		offlinePayload.c_str());
 
 	if (connected)
 	{
@@ -3595,7 +3625,8 @@ void loop()
 	else
 	{
 		mqttClient.loop();
-
+		if (now - lastMqttStatusMs >= MQTT_STATUS_INTERVAL_MS)
+			publishDeviceStatus("heartbeat", "ready", "", "");
 	}
 
 	// ---------- Screen refresh (NO JUMPS + IDLE FIX) ----------

@@ -37,7 +37,7 @@ only after two model implementations genuinely use it.
 | Model | Hardware | Status | Version | OTA channel |
 | --- | --- | --- | --- | --- |
 | Notificator Base | ESP32-C3 SuperMini, SSD1306 OLED, TTP223 touch | Stable | `1.2.1` | `stable` |
-| Notificator Touch 3.49 | Waveshare ESP32-S3 Touch LCD 3.49 | Preview | `0.9.1` | `preview` |
+| Notificator Touch 3.49 | Waveshare ESP32-S3 Touch LCD 3.49 | Preview | `0.9.2` | `preview` |
 | Notificator Matter | To be announced | Planned | — | — |
 
 Production sketches:
@@ -355,7 +355,7 @@ Current Touch metadata:
 - Model name: `Notificator Touch 3.49`
 - Model ID: `notificator_touch_349`
 - Board ID: `waveshare-esp32-s3-touch-lcd-3.49`
-- Firmware version: `0.9.1 Preview`
+- Firmware version: `0.9.2 Preview`
 
 ## License
 

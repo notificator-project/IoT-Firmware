@@ -4,7 +4,7 @@
 ESP32-S3-Touch-LCD-3.49. It is separate from the hardware diagnostic so factory
 and field troubleshooting can continue without changing the user-facing model.
 
-The current public-development firmware is **0.9.1 Preview**. Touch remains a
+The current public-development firmware is **0.9.2 Preview**. Touch remains a
 pre-1.0 model while its interaction design and field-update flow are validated.
 
 ## Current development slice

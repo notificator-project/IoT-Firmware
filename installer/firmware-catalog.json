@@ -16,7 +16,7 @@
 			"id": "notificator-touch-349-preview",
 			"name": "Notificator Touch 3.49",
 			"board": "Waveshare ESP32-S3 Touch LCD 3.49",
-			"version": "0.9.1",
+			"version": "0.9.2",
 			"channel": "Preview",
 			"badge": "Preview hardware",
 			"description": "The preview firmware for the Waveshare ESP32-S3 Touch LCD 3.49 with its capacitive display, audio codec, clock, weather, and alert interface.",

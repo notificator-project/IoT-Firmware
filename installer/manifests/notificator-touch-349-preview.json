@@ -1,6 +1,6 @@
 {
 	"name": "Notificator Touch 3.49",
-	"version": "0.9.1",
+	"version": "0.9.2",
 	"funding_url": "https://buymeacoffee.com/vagelis",
 	"new_install_prompt_erase": false,
 	"new_install_improv_wait_time": 0,
@@ -10,7 +10,7 @@
 			"improv": false,
 			"parts": [
 				{
-					"path": "../firmware/notificator-touch-349-0.9.1.factory.bin",
+					"path": "../firmware/notificator-touch-349-0.9.2.factory.bin",
 					"offset": 0
 				}
 			]

@@ -44,8 +44,8 @@
 
 namespace
 {
-constexpr char FIRMWARE_VERSION[] = "0.9.1";
-constexpr char FIRMWARE_LABEL[] = "0.9.1 PREVIEW";
+constexpr char FIRMWARE_VERSION[] = "0.9.2";
+constexpr char FIRMWARE_LABEL[] = "0.9.2 PREVIEW";
 constexpr char MODEL_ID[] = "notificator_touch_349";
 constexpr char WIFI_AP_PREFIX[] = "WPNOTIF-";
 constexpr char DEFAULT_MQTT_TOPIC_PREFIX[] = "notificator-project";
@@ -1478,10 +1478,13 @@ void renderLvglClock()
 	const String conditionText = weatherHasData
 		? weatherConditionLabel(weatherCode)
 		: (WiFi.isConnected() ? "UPDATING" : "OFFLINE");
+	// Make pending alerts visible even while the low-distraction clock is active.
+	// Red is reserved for attention states throughout the Touch interface.
+	const uint16_t timeColor = unreadAlertCount() > 0 ? COLOR_RED : COLOR_WHITE;
 
 	if (idleTheme == 1)
 	{
-		drawCenteredText(190, 35, timeText, 9, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(190, 35, timeText, 9, timeColor, COLOR_BLACK);
 		drawCenteredText(190, 125, dateText, 2, COLOR_MUTED, COLOR_BLACK);
 		fillRectangle(386, 22, 2, 128, COLOR_PANEL_RAISED);
 		drawCenteredText(510, 23, cityText, 2, COLOR_BLUE_LIGHT, COLOR_BLACK);
@@ -1498,7 +1501,7 @@ void renderLvglClock()
 	}
 	else
 	{
-		drawCenteredText(SCREEN_WIDTH / 2, 24, timeText, 13, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 24, timeText, 13, timeColor, COLOR_BLACK);
 		drawCenteredText(SCREEN_WIDTH / 2, 140, dateText, 2, COLOR_MUTED, COLOR_BLACK);
 	}
 	presentDisplay();
@@ -3304,6 +3307,7 @@ void drawIdleClockScreen()
 		return;
 	}
 	fillRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_BLACK);
+	const uint16_t timeColor = unreadAlertCount() > 0 ? COLOR_RED : COLOR_WHITE;
 
 	tm clockTime = {};
 	if (readLocalClock(clockTime))
@@ -3314,13 +3318,13 @@ void drawIdleClockScreen()
 		strftime(dateBuffer, sizeof(dateBuffer), "%a %d %b", &clockTime);
 		String dateText = String(dateBuffer);
 		dateText.toUpperCase();
-		drawCenteredText(SCREEN_WIDTH / 2, 42, String(timeBuffer), 10, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 42, String(timeBuffer), 10, timeColor, COLOR_BLACK);
 		drawCenteredText(SCREEN_WIDTH / 2, 137, dateText, 2, COLOR_MUTED, COLOR_BLACK);
 		lastClockMinute = clockTime.tm_min;
 	}
 	else
 	{
-		drawCenteredText(SCREEN_WIDTH / 2, 42, "--:--", 10, COLOR_WHITE, COLOR_BLACK);
+		drawCenteredText(SCREEN_WIDTH / 2, 42, "--:--", 10, timeColor, COLOR_BLACK);
 		drawCenteredText(SCREEN_WIDTH / 2, 137, WiFi.isConnected() ? "SYNCING TIME" : "CONNECT WIFI FOR TIME", 2,
 			COLOR_MUTED, COLOR_BLACK);
 		lastClockMinute = -1;

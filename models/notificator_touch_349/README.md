@@ -28,6 +28,8 @@ pre-1.0 model while its interaction design and field-update flow are validated.
   rollback to the previous network when a new connection fails
 - A black digital-clock idle screen after 60 seconds, with one-tap wake and
   automatic time-offset detection during setup
+- An unread-alert clock cue: the time changes from white to red while any local
+  alert remains unread, then returns to white after the alerts are read
 - Clock, Weather & Clock, and Weather idle modes configured from the mobile app
 - Saved city, coordinates, and POSIX timezone configuration with Open-Meteo
   current conditions
@@ -81,6 +83,8 @@ blank submission keeps the password already stored on the device.
 - Leave the display untouched for 60 seconds to enter the clock screen; any
   touch, notification, or physical button wakes it. Battery percentage stays
   hidden on this ambient view to keep the clock and weather presentation clean.
+  The time is red whenever the local inbox contains an unread alert and returns
+  to white after every alert has been read.
 - Battery percentage is an estimate derived from the board's documented 3:1
   ADC divider. `USB` is shown when a plausible battery voltage is not detected.
 - The board does not expose a dependable charger-status signal to the ESP32, so
